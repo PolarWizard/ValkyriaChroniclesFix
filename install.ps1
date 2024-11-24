@@ -59,6 +59,7 @@ resolution:
 fixes:
 
   # If enabled HUD will be centered and fixed to 16:9
+  # If disabled HUD will span up to chosen resolution from above
   centerHud:
     enable: true
 
