@@ -77,7 +77,7 @@ if (Test-Path -Path $gameFolder) {
     Write-Output "Copying $pyPatch to $fullPath"
     Copy-Item -Path $PSScriptRoot\$pyPatch -Destination "$fullPath"
     Write-Host "Running PyInstaller..."
-    pyinstaller $fullPath\$pyPatch
+    pyinstaller --specpath $fullPath --distpath $fullPath --onefile $fullPath\$pyPatch
     Write-Output "Creating $fixName.yml at $fullPath"
     New-Item -Path $fullPath -Name "$fixName.yml" -ItemType File -Value $ymlFileContent -Force | Out-Null
     Write-Output "Done!"
