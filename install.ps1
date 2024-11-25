@@ -62,10 +62,6 @@ fixes:
   # If disabled HUD will span up to chosen resolution from above
   centerHud:
     enable: true
-
-  # If enabled textures will be restored
-  fov:
-    enable: true
 "@
 
 if (Test-Path -Path $gameFolder) {

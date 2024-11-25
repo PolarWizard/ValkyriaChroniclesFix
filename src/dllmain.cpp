@@ -119,7 +119,7 @@
 #include "utils.hpp"
 
 // Macros
-#define VERSION "1.0.0"
+#define VERSION "1.0.1"
 #define LOG(STRING, ...) spdlog::info("{} : " STRING, __func__, ##__VA_ARGS__)
 
 // .yml to struct
@@ -132,13 +132,9 @@ typedef struct resolution_t {
 typedef struct centerHud_t {
     bool enable;
 } textures_t;
-typedef struct fov_t {
-    bool enable;
-} fov_t;
 
 typedef struct fix_t {
     centerHud_t centerHud;
-    fov_t fov;
 } fix_t;
 
 typedef struct yml_t {
@@ -205,9 +201,6 @@ void readYml() {
 
     yml.fix.centerHud.enable = config["fixes"]["centerHud"]["enable"].as<bool>();
 
-    yml.fix.fov.enable = config["fixes"]["fov"]["enable"].as<bool>();
-
-    // Initialize globals
     if (yml.resolution.width == 0 || yml.resolution.height == 0) {
         std::pair<int, int> dimensions = Utils::GetDesktopDimensions();
         yml.resolution.width  = dimensions.first;
@@ -221,7 +214,6 @@ void readYml() {
     LOG("Resolution.Height: {}", yml.resolution.height);
     LOG("Resolution.AspectRatio: {}", yml.resolution.aspectRatio);
     LOG("Fix.CenterHud.Enable: {}", yml.fix.centerHud.enable);
-    LOG("Fix.Fov.Enable: {}", yml.fix.fov.enable);
 }
 
 /**
@@ -268,7 +260,7 @@ void centerUiIconsFix() {
             static SafetyHookMid centerUiIconsHook{};
             centerUiIconsHook = safetyhook::create_mid(reinterpret_cast<void*>(hookAbsAddr),
                 [](SafetyHookContext& ctx) {
-                    *((float*)(ctx.esp + 0xC)) = 1280.0f; //THIS IS IT!!!
+                    *((float*)(ctx.esp + 0xC)) = 1280.0f;
                 }
             );
             LOG("Hooked @ 0x{:x} + 0x{:x} = 0x{:x}", relAddr, hookOffset, hookRelAddr);
