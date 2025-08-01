@@ -31,8 +31,9 @@ cmake --install .
 - Adjust settings in `Valkyria Chronicles/scripts/ValkyriaChroniclesFix.yml`
 
 ## Screenshots
-![Demo](images/ValkyriaChroniclesFix_1.gif)
-<p style="text-align: center;">Fix disabled → Fix enabled with centered HUD → Fix enabled with spanned HUD</p>
+| ![Demo](images/ValkyriaChroniclesFix_1.gif) |
+| --- |
+| <p align='center'>Fix disabled → Fix enabled with centered HUD → Fix enabled with spanned HUD</p> |
 
 ## License
 Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
