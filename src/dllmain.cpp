@@ -43,6 +43,7 @@
 #include <windows.h>
 #include <string>
 #include <filesystem>
+#include <fstream>
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
@@ -170,6 +171,114 @@ void readYml() {
     LOG("Name: {}", yml.name);
     LOG("MasterEnable: {}", yml.masterEnable);
     LOG("-------------------------------------");
+}
+
+/**
+ * @brief Sets the large-address-aware flag in an exe on disk; the original is kept as `<exe>.bak`.
+ *
+ * @return true if the exe now has the flag.
+ */
+bool patchLargeAddressAware(const std::filesystem::path& exe) {
+    std::filesystem::path patched = exe;
+    patched += ".laa";
+    std::filesystem::path backup = exe;
+    backup += ".bak";
+    std::error_code ec;
+    if (!std::filesystem::copy_file(exe, patched, std::filesystem::copy_options::overwrite_existing, ec)) {
+        return false;
+    }
+    bool written = false;
+    {
+        std::fstream file(patched, std::ios::in | std::ios::out | std::ios::binary);
+        LONG ntOffset = 0;
+        DWORD signature = 0;
+        WORD characteristics = 0;
+        std::streamoff field = offsetof(IMAGE_NT_HEADERS, FileHeader.Characteristics);
+        file.seekg(offsetof(IMAGE_DOS_HEADER, e_lfanew));
+        file.read(reinterpret_cast<char*>(&ntOffset), sizeof(ntOffset));
+        file.seekg(ntOffset);
+        file.read(reinterpret_cast<char*>(&signature), sizeof(signature));
+        file.seekg(ntOffset + field);
+        file.read(reinterpret_cast<char*>(&characteristics), sizeof(characteristics));
+        if (file && signature == IMAGE_NT_SIGNATURE) {
+            characteristics |= IMAGE_FILE_LARGE_ADDRESS_AWARE;
+            file.seekp(ntOffset + field);
+            file.write(reinterpret_cast<const char*>(&characteristics), sizeof(characteristics));
+            written = static_cast<bool>(file.flush());
+        }
+    }
+    // Windows lets a running exe be renamed but not replaced, so it moves aside for the patched copy.
+    if (written) {
+        std::filesystem::rename(exe, backup, ec);
+        written = !ec;
+    }
+    if (written) {
+        std::filesystem::rename(patched, exe, ec);
+        if (ec) {
+            std::filesystem::rename(backup, exe, ec);
+            written = false;
+        }
+    }
+    if (!written) {
+        std::filesystem::remove(patched, ec);
+    }
+    return written;
+}
+
+/**
+ * @brief Gives the game 4 GB of address space instead of 2 GB by making Valkyria.exe large-address-aware.
+ *
+ * @details
+ * Every render target is `W x W`, and the PC port keeps CPU heap copies of four of them to restore them after a
+ * device Reset (`FUN_004046f0`), each refreshed through a full-size `4 * W * W` byte SYSTEMMEM readback: about
+ * 900 MB of copies plus 225 MB blocks at 7680 wide, more than a 32-bit exe without the flag can fit next to the
+ * rest of the game. The game's D3D error report then crashes on the failed readback (it indexes its 11-entry
+ * name table with kind 11).
+ *
+ * Windows reads IMAGE_FILE_LARGE_ADDRESS_AWARE from the exe header when the process starts. When this process
+ * started without it, the exe is patched on disk (`patchLargeAddressAware`) at the entry of WinMain
+ * (`FUN_005cd480`), before the game takes its single-instance mutex, starts Steam or creates its window, and the
+ * game is started again with the same command line while this process ends. A Steam file verification or update
+ * restores the original exe, and the next start patches it again.
+ *
+ * @return void
+ */
+void fixLargeAddressAware() {
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(module.address);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(reinterpret_cast<u8*>(module.address) + dos->e_lfanew);
+    if ((nt->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) != 0) {
+        return;
+    }
+    Utils::SignatureHook hook {
+        .tag = __func__,
+        .signature = "55    8B EC    83 E4 F8    81 EC C0 08 00 00    56    57    68 ?? ?? ?? ??    6A 01    6A 00    FF 15",
+        .offset = 0
+    };
+    Utils::injectHook(yml.masterEnable, module, hook,
+        [](SafetyHookContext& ctx) {
+            WCHAR path[MAX_PATH] = { 0 };
+            GetModuleFileNameW(module.address, path, MAX_PATH);
+            std::filesystem::path exe = path;
+            if (!patchLargeAddressAware(exe)) {
+                spdlog::error("fixLargeAddressAware : Could not patch {:s}; the game keeps 2 GB of memory and can run "
+                    "out of it at ultrawide resolutions", exe.string());
+                return;
+            }
+            STARTUPINFOW startup { sizeof(startup) };
+            PROCESS_INFORMATION process {};
+            std::wstring commandLine = GetCommandLineW();
+            if (!CreateProcessW(exe.c_str(), commandLine.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                exe.parent_path().c_str(), &startup, &process)) {
+                spdlog::error("fixLargeAddressAware : Patched {:s}, but could not restart it; it gets 4 GB from the next "
+                    "start", exe.string());
+                return;
+            }
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+            LOG("fixLargeAddressAware : Patched {:s} and restarted it", exe.string());
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
+    );
 }
 
 /**
@@ -334,6 +443,7 @@ BOOL APIENTRY DllMain(
         }
         try {
             readYml();
+            fixLargeAddressAware();
             fixResolution();
         }
         catch (const std::exception& e) {
