@@ -54,6 +54,7 @@
 #include <fstream>
 #include <cstdint>
 #include <cmath>
+#include <numbers>
 #include <algorithm>
 #include <array>
 #include <vector>
@@ -167,6 +168,9 @@ namespace {
     bool saveLoadBarsHooked = false;
     /// The launcher's "windowed" setting from `system_config.xml` (`0x01b940ac`), 1 for a windowed device.
     i32* windowedSetting = nullptr;
+    /// SpeedGrass frustum inputs: `aspect * vfov` and `aspect`.
+    f32* grassAngle = nullptr;
+    f32* grassAspect = nullptr;
 
     /**
      * @brief Reads a 4-byte absolute operand from the instruction bytes of a signature match.
@@ -1290,6 +1294,80 @@ void fixSaveLoad() {
 }
 
 /**
+ * @brief Stops the SpeedGrass grass culling from hiding visible grass on ultrawide screens.
+ *
+ * @details
+ * The SpeedGrass camera update `FUN_006dc060` stores `aspect = DisplayWidth / DisplayHeight` at `0x01705088`
+ * and `A = aspect * vfov` at `0x01705084`. `FUN_006dc960` builds the grass culling planes from them: the left
+ * and right planes at a half-angle of `A / 2`, the upper and lower ones at `A / 2 * aspect = aspect^2 * vfov / 2`,
+ * converted to 16-bit angles that wrap at 360 degrees (`and ecx, 0xffff` in `FUN_0080c170`). At 16:9 the
+ * upper/lower half-angle is 94.8 degrees for a 60 degree FOV, wider than the view and so never culling
+ * anything visible. At 32:9 it is 379 degrees, which wraps to 19 degrees and culls the grass above and below
+ * the middle of the screen.
+ *
+ * A second stage limits which grid cells are tested at all: `FUN_006dc960` also builds a 2D bounding box of
+ * the camera position and the four far-plane corners, `far * (forward +- tan(bh) * up +- tan(bv) * right)`,
+ * with the roles crossed (the horizontal extent comes from the upper/lower half-angle `bv`), and
+ * `FUN_006da890` marks every cell outside it as culled. At the game's default 50 degree FOV the stock values
+ * cull all grass at 32:9 and the side cells at 21:9.
+ *
+ * How was this found?
+ * `0x01705084` and `0x01705088` are written only by `FUN_006dc060` (every frame, right before the call into
+ * `FUN_006dc960`) and read only at `fld [0x01705084]; fmul qword [0.5]` and the `fmul [0x01705088]` after it.
+ * The bounding box comes from `tan(bh) * far` and `tan(bv) * far` at `0x006dce8f`/`0x006dceb6`.
+ *
+ * Why it works:
+ * Before those reads, the hook rewrites both values from the true horizontal half-angle of the view,
+ * `alpha = atan(aspect * tan(vfov / 2))`:
+ * - `bh = (16/9) * vfov / 2 + alpha - atan((16/9) * tan(vfov / 2))`: the true half-angle plus the margin the
+ *   stock code has at 16:9, at most `180 - alpha - 1` degrees so the plane never wraps.
+ * - `bv = (16/9)^2 * vfov / 2`, the stock 16:9 value, clamped to `[alpha + 1, 180 - alpha - 1]` degrees.
+ *   The lower bound is required by the bounding box: it gives `|tan(bv)| >= aspect * tan(vfov / 2)`, the
+ *   half-width the view really needs, which the stock 16:9 value does not at wide FOVs.
+ *
+ * Both stages then keep every visible cell for any aspect ratio and FOV. The hook is a no-op at 16:9 and
+ * narrower.
+ *
+ * @return void
+ */
+void fixGrassCulling() {
+    Utils::SignatureHook hook {
+        .tag = __func__,
+        .signature = "D9 05 ?? ?? ?? ??    DC 0D ?? ?? ?? ??    DD 94 24 F0 00 00 00    D8 0D ?? ?? ?? ??    DD 94 24 F8 00 00 00",
+        .offset = 0
+    };
+    bool enable = yml.masterEnable;
+    if (enable) {
+        // The operands of `fld [angle]` at +0 and `fmul [aspect]` at +0x13.
+        grassAngle = resolveOperand<f32>(hook.signature, 0x02);
+        grassAspect = resolveOperand<f32>(hook.signature, 0x15);
+    }
+    Utils::injectHook(enable, module, hook,
+        [](SafetyHookContext& ctx) {
+            // The x87 stack is empty here, so the CRT tan/atan are safe to call.
+            constexpr f64 r = 16.0 / 9.0;
+            constexpr f64 pi = std::numbers::pi;
+            constexpr f64 degree = pi / 180.0;
+            f64 a = *grassAspect;
+            f64 combined = *grassAngle;
+            // Positive form, so NaN leaves the values alone.
+            if (!screen.ultrawide || !(combined > 0.0) || !(a > r + 1e-4)) {
+                return;
+            }
+            f64 vfov = combined / a;
+            f64 t = std::tan(vfov / 2.0);
+            f64 alpha = std::atan(a * t);
+            f64 hi = pi - alpha - degree;
+            f64 lo = (std::min)(alpha + degree, hi);
+            f64 bh = (std::min)(r * vfov / 2.0 + alpha - std::atan(r * t), hi);
+            f64 bv = std::clamp(r * r * vfov / 2.0, lo, hi);
+            *grassAngle = static_cast<f32>(2.0 * bh);
+            *grassAspect = static_cast<f32>(bv / bh);
+        }
+    );
+}
+
+/**
  * @brief Entry point for a DLL, called by the system when the DLL is loaded or unloaded.
  *
  * @details
@@ -1338,6 +1416,7 @@ BOOL APIENTRY DllMain(
             fixHudModels();
             fixRadar();
             fixSaveLoad();
+            fixGrassCulling();
         }
         catch (const std::exception& e) {
             spdlog::error("DllMain : {}; the fixes installed before this point stay active", e.what());
