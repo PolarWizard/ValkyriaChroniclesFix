@@ -57,6 +57,7 @@
 #include <algorithm>
 #include <array>
 #include <vector>
+#include <bit>
 #include <cstring>
 
 // Local includes
@@ -883,6 +884,44 @@ void fixEyeMarks() {
 }
 
 /**
+ * @brief Keeps the 3D pieces of the HUD (CP and AP gauges and the like) where a 16:9 screen puts them.
+ *
+ * @details
+ * `FUN_0058a810` places the 3D model parts of every VlInterfaceDraw (CP and AP gauges, the gravepost, the
+ * radar window frame) by unprojecting a fixed screen x at the part's depth through the main 3D screen. The
+ * unprojection is relative to the screen center, which moves from `W169 / 2` to `W / 2` with the full-width
+ * box, so the parts drift left of the centered HUD by `(W - W169) / 2`.
+ *
+ * How was this found?
+ * On the fixed-position branch (`+0xa8 == 0`) the part's `+0x80`/`+0x84` are loaded into ECX/EDX and stored
+ * as the point to unproject (`mov [ebp-0x20], ecx; mov [ebp-0x1c], edx`) before `FUN_0080f530`.
+ *
+ * Why it works:
+ * Adding `(W - W169) / 2` to x keeps its distance from the screen center, so the unprojected point is exactly
+ * where a 16:9 screen of the same height puts it.
+ *
+ * @return void
+ */
+void fixHudModels() {
+    Utils::SignatureHook hook {
+        .tag = __func__,
+        .signature = "8B 88 80 00 00 00    8B 90 84 00 00 00    89 4D E0    89 55 E4    D9 80 88 00 00 00",
+        .offset = 0x0C
+    };
+    bool enable = yml.masterEnable && yml.hud;
+    Utils::injectHook(enable, module, hook,
+        [](SafetyHookContext& ctx) {
+            f32 shift = hudOffset();
+            if (shift == 0.0f) {
+                return;
+            }
+            f32 x = std::bit_cast<f32>(static_cast<u32>(ctx.ecx));
+            ctx.ecx = std::bit_cast<u32>(x + shift);
+        }
+    );
+}
+
+/**
  * @brief Entry point for a DLL, called by the system when the DLL is loaded or unloaded.
  *
  * @details
@@ -925,6 +964,7 @@ BOOL APIENTRY DllMain(
             fixFades();
             fixHudMarkers();
             fixEyeMarks();
+            fixHudModels();
         }
         catch (const std::exception& e) {
             spdlog::error("DllMain : {}; the fixes installed before this point stay active", e.what());
