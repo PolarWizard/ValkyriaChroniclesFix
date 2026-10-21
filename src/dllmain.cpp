@@ -129,6 +129,9 @@ namespace {
         std::vector<u8> bytes;
     };
 
+    /// Return address of the `FUN_00610430` call in the unit avoidance check `FUN_004da1f0`.
+    uintptr_t avoidanceReturn = 0;
+
     /// UI screen table y scale `boxH / 720`; the x scale `boxW / 1280` is the float right before it.
     f32* uiTableScaleY = nullptr;
     /// The launcher's "windowed" setting from `system_config.xml` (`0x01b940ac`), 1 for a windowed device.
@@ -754,6 +757,84 @@ void fixFades() {
 }
 
 /**
+ * @brief Keeps the HUD markers drawn over units on their units.
+ *
+ * @details
+ * Two functions project a world position to the main 3D screen and convert the pixel position to virtual
+ * UI units as `sX / sx`:
+ * - `FUN_0058d1b0`, slot 8 of SlgInterfaceHpMini, SlgInterfaceIWSpriteParts and VlInterfaceSprite3D (unit
+ *   HP gauges, impact warnings, 3D sprites). The projected x sits at `[esp+0x18]`.
+ * - `FUN_00610430`, the projection used by VlSprite, the scout direction band and unit selection. The
+ *   projected x has been stored to `[esi]`; EDI holds the HyScreen whose 2D params divide it.
+ *
+ * `x / sx` is only the inverse of the 2D mapping while the 2D offset cancels against the screen center,
+ * which holds for the stock table. With the centered HUD the marker lands `(W - W169) / 2` too far right.
+ *
+ * One caller of `FUN_00610430` is not a marker: the unit avoidance check `FUN_004da1f0` subtracts
+ * `(DisplayWidth / 2, DisplayHeight / 2)` pixels from the virtual result and compares the distance against a
+ * pixel radius, mixing units. For that caller (recognized by its return address) the hook instead keeps the
+ * value the check sees on a 16:9 screen of the same height: `sX' = sX - D + sx * D`, so that
+ * `sX' / sx - W / 2 = sX169 / sx - W169 / 2`.
+ *
+ * How was this found?
+ * Both divisions read the HyScreen's 2D x scale at `+0x88` (`fdiv [eax+0x88]` / `fdiv [edi+0x88]`) right
+ * after the projection.
+ *
+ * Why it works:
+ * The inverse of `px = W/2 + sx * (x + offx - W/2)` is `x = (px - D) / sx` with
+ * `D = sx * (offx - W/2) + W/2`. Subtracting `D` from the projected x before the game divides gives the
+ * exact virtual position. `D` is `(W - W169) / 2` for screens built from the centered table and 0 for
+ * pixel-space screens (scale 1, offset 0), so each call gets the right value for its own screen.
+ *
+ * @return void
+ */
+void fixHudMarkers() {
+    Utils::SignatureHook spriteHook {
+        .tag = "fixHudMarkers (sprite3d)",
+        .signature = "E8 ?? ?? ?? ??    D9 44 24 18    8B 15 ?? ?? ?? ??    8B 82 94 00 00 00    D8 B0 88 00 00 00",
+        .offset = 5
+    };
+    Utils::SignatureHook projectHook {
+        .tag = "fixHudMarkers (project)",
+        .signature = "D9 87 8C 00 00 00    D9 5C 24 1C    D9 06    D8 B7 88 00 00 00    D9 1E",
+        .offset = 0
+    };
+    bool enable = yml.masterEnable && yml.hud;
+    Utils::injectHook(enable, module, spriteHook,
+        [](SafetyHookContext& ctx) {
+            *reinterpret_cast<f32*>(ctx.esp + 0x18) -= hudOffset();
+        }
+    );
+    if (enable) {
+        std::string avoidanceSig = "8D B5 60 FF FF FF    E8 ?? ?? ?? ??    D9 85 64 FF FF FF    D8 65 B4";
+        uintptr_t addr = Utils::patternScan(module.address, avoidanceSig);
+        avoidanceReturn = addr != 0 ? addr + 0x0B : 0;
+        if (addr == 0) {
+            LOG("fixHudMarkers (avoidance) : Did not find '{}'", avoidanceSig);
+        }
+    }
+    Utils::injectHook(enable, module, projectHook,
+        [](SafetyHookContext& ctx) {
+            if (!screen.hudCentred) {
+                return;
+            }
+            // The x87 stack holds one value here, so this only uses SSE arithmetic.
+            f32 offx = *reinterpret_cast<f32*>(ctx.edi + 0x80);
+            f32 sx = *reinterpret_cast<f32*>(ctx.edi + 0x88);
+            f32 halfWidth = screen.width / 2.0f;
+            f32 shift = sx * (offx - halfWidth) + halfWidth;
+            f32& x = *reinterpret_cast<f32*>(ctx.esi);
+            if (*reinterpret_cast<uintptr_t*>(ctx.ebp + 4) == avoidanceReturn) {
+                x += (sx - 1.0f) * shift;
+            }
+            else {
+                x -= shift;
+            }
+        }
+    );
+}
+
+/**
  * @brief Entry point for a DLL, called by the system when the DLL is loaded or unloaded.
  *
  * @details
@@ -794,6 +875,7 @@ BOOL APIENTRY DllMain(
             fixHud();
             fixFullscreenBackgrounds();
             fixFades();
+            fixHudMarkers();
         }
         catch (const std::exception& e) {
             spdlog::error("DllMain : {}; the fixes installed before this point stay active", e.what());
