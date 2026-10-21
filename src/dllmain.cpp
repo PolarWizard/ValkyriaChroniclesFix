@@ -1218,6 +1218,61 @@ void fixMovieBars() {
 }
 
 /**
+ * @brief Makes the book menu's page-turn mesh show the centered 16:9 spread of the page.
+ *
+ * @details
+ * The book menu (EsdInterfaceMain) renders its pages into the square page render targets and turns pages
+ * with a mesh (`val_in_page.hmd`, the only CnFrameBufTexModel) that samples them. Its constructor runs
+ * `FUN_006c4dc0` once to map the mesh's PS3 UVs onto the PC render target: `u = u0 * us` with
+ * `us = (2050 / 1280) * boxW / sqW` at `[ebp-0x10]`. The mesh is a centered perspective model, so with the Hor+
+ * view it covers the middle `W169` columns, where the centered HUD puts the page content, but its UVs cover the
+ * full width: the turning page shows the spread squeezed 2x at 32:9.
+ *
+ * How was this found?
+ * The UV loop reads the source floats from `[this+0x4c]` (four per vertex, u0 first) and the vertex count from
+ * the model (`[[[model+0x54]+0x60]+0x14]`); the hook sits after the loop's cache-key test, where ESI is the
+ * model and EDI this.
+ *
+ * Why it works:
+ * Pre-biasing the source as `u0' = u0 * W169 / boxW + OX / (us * sqW)` makes the game's own loop produce
+ * `u = (OX + u0 * (2050 / 1280) * W169) / sqW`, the centered sub-rect the page content occupies.
+ *
+ * @return void
+ */
+void fixBookPageMesh() {
+    Utils::SignatureHook hook {
+        .tag = __func__,
+        .signature = "8B 56 54    8B 9E B0 00 00 00    8B 42 60    8B 77 4C",
+        .offset = 0
+    };
+    bool enable = yml.masterEnable && yml.hud && screenStruct.boxWidth != nullptr;
+    Utils::injectHook(enable, module, hook,
+        [](SafetyHookContext& ctx) {
+            if (!screen.hudCentred) {
+                return;
+            }
+            f32 us = *reinterpret_cast<f32*>(ctx.ebp - 0x10);
+            f32* source = *reinterpret_cast<f32**>(ctx.edi + 0x4C);
+            uintptr_t model = *reinterpret_cast<uintptr_t*>(ctx.edi + 0x48);
+            if (!(us > 0.0f) || source == nullptr || model == 0) {
+                return;
+            }
+            uintptr_t mesh = *reinterpret_cast<uintptr_t*>(model + 0x54);
+            uintptr_t vertices = mesh != 0 ? *reinterpret_cast<uintptr_t*>(mesh + 0x60) : 0;
+            i32 count = vertices != 0 ? *reinterpret_cast<i32*>(vertices + 0x14) : 0;
+            if (count <= 0) {
+                return;
+            }
+            f32 scale = screen.width169 / static_cast<f32>(*screenStruct.boxWidth);
+            f32 bias = screen.offset169 / (us * static_cast<f32>(*screenStruct.squareWidth));
+            for (i32 i = 0; i < count; i++) {
+                source[4 * i] = source[4 * i] * scale + bias;
+            }
+        }
+    );
+}
+
+/**
  * @brief Keeps the radar inside its frame, undistorted.
  *
  * @details
@@ -1541,6 +1596,7 @@ BOOL APIENTRY DllMain(
             fixGrassCulling();
             fixCommandCursor();
             fixMovieBars();
+            fixBookPageMesh();
         }
         catch (const std::exception& e) {
             spdlog::error("DllMain : {}; the fixes installed before this point stay active", e.what());
