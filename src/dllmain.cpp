@@ -835,6 +835,54 @@ void fixHudMarkers() {
 }
 
 /**
+ * @brief Keeps the command mode eye marks where a 16:9 screen puts them.
+ *
+ * @details
+ * The eye marks of the command cursor (SlgInterfaceEyeMarkSpriteParts) are placed by three projections of
+ * the main 3D screen whose pixel x is stored as the mark's translation (`+0xc0`, applied by `FUN_00516360` in
+ * the HUD's virtual space): one in `FUN_00517120` and two in `FUN_00517280`. A fourth state
+ * (`FUN_00517460`) projects through a temporary virtual 1280x720 screen and needs nothing.
+ *
+ * The 3D view is Hor+, so a point that is at pixel `x` on a 16:9 screen of the same height is at
+ * `x + (W - W169) / 2` on the full-width screen, while the HUD it is drawn in starts at the same 16:9 offset.
+ *
+ * How was this found?
+ * Each site pushes `&outX` (`[ebp-8]`, `[ebp-0xc]`, `[ebp-0x10]`) for the projection `FUN_0080fba0` and
+ * copies it into `+0xc0` after the call. The hooks sit right after each call.
+ *
+ * Why it works:
+ * Subtracting `(W - W169) / 2` from the projected x gives the value a 16:9 screen of the same height
+ * produces, which the centered HUD then places at the same spot over the 3D view.
+ *
+ * @return void
+ */
+void fixEyeMarks() {
+    // outX is at [ebp-8], [ebp-0xc] and [ebp-0x10] respectively.
+    Utils::SignatureHook state1 {
+        .tag = "fixEyeMarks (state 1)",
+        .signature = "8D 55 E0    8D 7D F4    E8 ?? ?? ?? ??    8B 55 FC    8B 42 08    85 C0    74 ??    6A 00    68",
+        .offset = 0x0B
+    };
+    Utils::SignatureHook state5a {
+        .tag = "fixEyeMarks (state 5a)",
+        .signature = "8D 55 E0    8D 7D F0    E8 ?? ?? ?? ??    8B 55 FC    8B 42 08    85 C0    0F 84",
+        .offset = 0x0B
+    };
+    Utils::SignatureHook state5b {
+        .tag = "fixEyeMarks (state 5b)",
+        .signature = "8D 55 D0    8D 7D F4    E8 ?? ?? ?? ??    8B 45 FC    8B 40 08    85 C0",
+        .offset = 0x0B
+    };
+    bool enable = yml.masterEnable && yml.hud;
+    Utils::injectHook(enable, module, state1,
+        [](SafetyHookContext& ctx) { *reinterpret_cast<f32*>(ctx.ebp - 0x08) -= hudOffset(); });
+    Utils::injectHook(enable, module, state5a,
+        [](SafetyHookContext& ctx) { *reinterpret_cast<f32*>(ctx.ebp - 0x0C) -= hudOffset(); });
+    Utils::injectHook(enable, module, state5b,
+        [](SafetyHookContext& ctx) { *reinterpret_cast<f32*>(ctx.ebp - 0x10) -= hudOffset(); });
+}
+
+/**
  * @brief Entry point for a DLL, called by the system when the DLL is loaded or unloaded.
  *
  * @details
@@ -876,6 +924,7 @@ BOOL APIENTRY DllMain(
             fixFullscreenBackgrounds();
             fixFades();
             fixHudMarkers();
+            fixEyeMarks();
         }
         catch (const std::exception& e) {
             spdlog::error("DllMain : {}; the fixes installed before this point stay active", e.what());
