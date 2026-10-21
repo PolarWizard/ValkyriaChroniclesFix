@@ -159,6 +159,12 @@ namespace {
 
     /// UI screen table y scale `boxH / 720`; the x scale `boxW / 1280` is the float right before it.
     f32* uiTableScaleY = nullptr;
+    /// The save/load overlay's helper that draws an untextured black pixel quad: (x, y, w, h, z, alpha).
+    using DrawBlackQuadFn = void(__stdcall*)(i32, i32, i32, i32, f32, f32);
+    DrawBlackQuadFn drawBlackQuad = nullptr;
+    /// The overlay's background alpha factor (`0x0174ad24`, 0.95).
+    f32* saveLoadAlphaScale = nullptr;
+    bool saveLoadBarsHooked = false;
     /// The launcher's "windowed" setting from `system_config.xml` (`0x01b940ac`), 1 for a windowed device.
     i32* windowedSetting = nullptr;
 
@@ -198,6 +204,18 @@ namespace {
         VirtualProtect(addr, patch.bytes.size(), oldProtect, &oldProtect);
         FlushInstructionCache(GetCurrentProcess(), addr, patch.bytes.size());
     }
+
+    /// A rectangle in back-buffer pixels.
+    struct PixelRect {
+        i32 x, y, w, h;
+    };
+
+    /// The side areas of the save/load overlay's current layout, filled black at the background's alpha.
+    struct SaveLoadBars {
+        bool valid = false;
+        PixelRect left{};
+        PixelRect right{};
+    } saveLoadBars;
 }
 
 /**
@@ -1041,6 +1059,7 @@ void fixTalkPanels() {
  * @details
  * - **DisplayWidth/Height.** The X anchor resolver's `fld [DisplayWidth]`, read before `fixTextLayout`
  *   redirects that operand.
+ * - **The save/load overlay's black quad helper** `FUN_00402f90`.
  *
  * A failure disables only the fixes that need that object, and is logged.
  *
@@ -1052,6 +1071,7 @@ void resolveShared() {
     }
     auto scan = [](std::string sig) { return Utils::patternScan(module.address, sig); };
     auto operand = [](uintptr_t addr) { return *reinterpret_cast<uintptr_t*>(addr); };
+    auto target = [](uintptr_t call) { return call + 5 + *reinterpret_cast<i32*>(call + 1); };
 
     uintptr_t anchor = scan("A8 01    74 0A    D9 05 ?? ?? ?? ??    8B E5    5D    C3    D9 05 ?? ?? ?? ??    DC 0D");
     if (anchor != 0 && operand(anchor + 0x06) == operand(anchor + 0x10)) {
@@ -1059,6 +1079,15 @@ void resolveShared() {
     }
     else {
         LOG("Did not find DisplayWidth");
+    }
+
+    uintptr_t quad = scan("55    8B EC    D9 45 1C    83 EC 50    DC 0D ?? ?? ?? ??    56");
+    uintptr_t quadCall = scan("56    57    52    50    E8 ?? ?? ?? ??    80 7C 24 27 00");
+    if (quad != 0 && quadCall != 0 && target(quadCall + 0x04) == quad) {
+        drawBlackQuad = reinterpret_cast<DrawBlackQuadFn>(quad);
+    }
+    else {
+        LOG("Did not find the black quad helper");
     }
 }
 
@@ -1175,6 +1204,92 @@ void fixTextLayout() {
 }
 
 /**
+ * @brief Centers the PC save/load screen at 16:9.
+ *
+ * @details
+ * The save/load overlay of the PC port (`FUN_00401df0`: save list, overwrite dialog, `background_PIC1.png`)
+ * draws pre-transformed pixel quads straight into the back buffer after the final composite. It lays itself
+ * out in the rect the composite passes (`[esp+8..0x14]` = x, y, w, h at entry), which is the screen struct's
+ * 16:9 box. With the full-width box the rect is the whole screen and the 16:9 background art is stretched
+ * across it.
+ *
+ * How was this found?
+ * Both callers (`FUN_00584610` and `FUN_0056c2c0`) push the box fields `0x01b94814..0x01b94820` as the rect,
+ * and every element is laid out from it: `background_PIC1.png` at exactly (x, y, w, h), the save slots, the
+ * icons and the text at fractions of w and h. The overlay object (`[esp+4]`) holds the background texture at
+ * `+0x14`, returns early unless `+0x1a0` is set, and fades the background in with an alpha of
+ * `0.95 * [+0x1b8]`.
+ *
+ * Why it works:
+ * Shrinking the rect to the centered `W169 x H` box lays the overlay out as on a 16:9 screen. With the stock
+ * pillarbox the composite left the side areas black, so while the background is shown the side areas are
+ * filled with black quads at the background's alpha, so they fade in and out with it. They are drawn right
+ * before the background (`fld [0.95]` at `0x00402386`, reached only when the background texture exists), with
+ * the alpha the overlay eased this frame (`[esp+0x14]`), inside the overlay's own render-state bracket
+ * (`0x0040234d..0x00402f29`), like the overlay's own black quads. If that site is not found, no bars are drawn.
+ *
+ * @return void
+ */
+void fixSaveLoad() {
+    Utils::SignatureHook overlayHook {
+        .tag = "fixSaveLoad (overlay)",
+        .signature = "55    8B EC    83 E4 F8    81 EC 7C 01 00 00    53    8B 5D 08    56    57    E8",
+        .offset = 0
+    };
+    Utils::SignatureHook barsHook {
+        .tag = "fixSaveLoad (bars)",
+        .signature = "85 C0    74 3B    D9 05 ?? ?? ?? ??    8B 55 10    D8 4C 24 14    50",
+        .offset = 4
+    };
+    bool enable = yml.masterEnable;
+    if (enable) {
+        // The operand of `fld [0.95]`, the factor the overlay applies to the background's alpha.
+        saveLoadAlphaScale = resolveOperand<f32>(barsHook.signature, 0x06);
+    }
+    saveLoadBarsHooked = Utils::injectHook(enable && saveLoadAlphaScale != nullptr && drawBlackQuad != nullptr,
+        module, barsHook,
+        [](SafetyHookContext& ctx) {
+            // The x87 stack is empty here.
+            if (!saveLoadBars.valid) {
+                return;
+            }
+            f32 alpha = *saveLoadAlphaScale * *reinterpret_cast<f32*>(ctx.esp + 0x14);
+            if (!(alpha > 0.0f)) {
+                return;
+            }
+            for (const PixelRect& bar : { saveLoadBars.left, saveLoadBars.right }) {
+                if (bar.w > 0 && bar.h > 0) {
+                    drawBlackQuad(bar.x, bar.y, bar.w, bar.h, 0.9f, alpha);
+                }
+            }
+        }
+    );
+    Utils::injectHook(enable, module, overlayHook,
+        [](SafetyHookContext& ctx) {
+            saveLoadBars.valid = false;
+            if (!screen.ultrawide) {
+                return;
+            }
+            i32* args = reinterpret_cast<i32*>(ctx.esp);
+            i32 x = args[2];
+            i32 y = args[3];
+            i32 w = args[4];
+            i32 h = args[5];
+            if (w * 9 <= h * 16) {
+                return;
+            }
+            i32 w169 = h * 16 / 9;
+            i32 x169 = x + (w - w169) / 2;
+            args[2] = x169;
+            args[4] = w169;
+            // The bars hook draws the side bars inside the overlay's render-state bracket with this frame's alpha. Without
+            // that hook there are none: drawn here they would use last frame's alpha, outside the bracket.
+            saveLoadBars = { saveLoadBarsHooked, { x, y, x169 - x, h }, { x169 + w169, y, x + w - (x169 + w169), h } };
+        }
+    );
+}
+
+/**
  * @brief Entry point for a DLL, called by the system when the DLL is loaded or unloaded.
  *
  * @details
@@ -1222,6 +1337,7 @@ BOOL APIENTRY DllMain(
             fixEyeMarks();
             fixHudModels();
             fixRadar();
+            fixSaveLoad();
         }
         catch (const std::exception& e) {
             spdlog::error("DllMain : {}; the fixes installed before this point stay active", e.what());
