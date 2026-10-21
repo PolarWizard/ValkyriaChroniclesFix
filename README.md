@@ -8,6 +8,7 @@ Adds support for ultrawide resolutions and additional features.
 ## Fixes
 - Support for ultrawide resolutions
 - Borderless fullscreen
+- Centered 16:9 HUD
 - Large Address Aware (4 GB patch, applied automatically)
 
 ## Build and Install

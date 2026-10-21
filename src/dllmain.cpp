@@ -37,6 +37,14 @@
  *   draws the frame at the box's offset. [`fixResolution`] widens the box to the full screen.
  * - **3D is Hor+.** The perspective builder (`FUN_0081bb90`) treats the FOV as vertical against
  *   `DisplayHeight`, so a wider frame shows more to the sides with the same vertical view.
+ * - **UI screen table.** The static initializer `FUN_00844dc0` builds a HyScreen preset at `0x017542cc`
+ *   from the box: viewport, center, 2D offset `(boxW - 1280) / 2` at `+0x44` and 2D scale `boxW / 1280`
+ *   at `+0x4c`, `boxH / 720` at `+0x50`. Every HUD and menu is laid out in a virtual 1280x720 space and
+ *   mapped to pixels by the 2D ortho of `FUN_0082a100`: `px = W/2 + sx * (x + offx - W/2)`.
+ *   [`fixHud`] makes that mapping a centered, undistorted 16:9 box.
+ * - **Pixel/virtual conversions.** A few draws compute a position in pixels and convert it to virtual
+ *   units by dividing by the 2D scale, assuming `px = x * sx`. With the centered mapping those need the
+ *   16:9 offset removed. The other fixes handle them one by one.
  */
 
 // System includes
@@ -68,6 +76,7 @@ typedef struct yml_t {
     bool masterEnable;
     resolution_t resolution;
     bool borderless;
+    bool hud;
 } yml_t;
 
 // Globals
@@ -90,6 +99,7 @@ namespace {
         f32 height = 0.0f;      ///< Back-buffer height H.
         f32 width169 = 0.0f;    ///< Width of the centered 16:9 box, H * 16 / 9.
         f32 offset169 = 0.0f;   ///< Left edge of the centered 16:9 box, (W - W169) / 2.
+        bool hudCentred = false;    ///< `fixHud` has centered the UI screen table.
     } screen;
 
     /// The largest texture current GPUs create under D3D9 (`D3DCAPS9::MaxTextureWidth`). The render targets are
@@ -118,6 +128,9 @@ namespace {
         uintptr_t address = 0;
         std::vector<u8> bytes;
     };
+
+    /// UI screen table y scale `boxH / 720`; the x scale `boxW / 1280` is the float right before it.
+    f32* uiTableScaleY = nullptr;
     /// The launcher's "windowed" setting from `system_config.xml` (`0x01b940ac`), 1 for a windowed device.
     i32* windowedSetting = nullptr;
 
@@ -132,6 +145,18 @@ namespace {
     T* resolveOperand(std::string sig, uintptr_t operandOffset) {
         uintptr_t addr = Utils::patternScan(module.address, sig);
         return addr != 0 ? *reinterpret_cast<T**>(addr + operandOffset) : nullptr;
+    }
+
+    /**
+     * @brief The horizontal offset the centered HUD adds to every virtual position.
+     *
+     * @details
+     * Inlined, so that callbacks at sites with live x87 values never call a function returning in ST(0).
+     *
+     * @return f32 (W - W169) / 2 once `fixHud` has centered the UI table on an ultrawide screen, else 0.
+     */
+    __forceinline f32 hudOffset() {
+        return screen.hudCentred ? screen.offset169 : 0.0f;
     }
 
     /**
@@ -209,6 +234,8 @@ void readYml() {
         yml.resolution.width = config["resolution"]["width"].as<i32>(0);
         yml.resolution.height = config["resolution"]["height"].as<i32>(0);
         yml.borderless = config["borderless"].as<bool>(true);
+
+        yml.hud = config["hud"].as<bool>(true);
     }
     catch (const std::exception& e) {
         // A missing or malformed file must not take the game down at startup.
@@ -223,6 +250,7 @@ void readYml() {
     LOG("Resolution.Width: {}", yml.resolution.width);
     LOG("Resolution.Height: {}", yml.resolution.height);
     LOG("Borderless: {}", yml.borderless);
+    LOG("HUD: {}", yml.hud);
     LOG("-------------------------------------");
 }
 
@@ -562,6 +590,65 @@ void fixResolution() {
 }
 
 /**
+ * @brief Centers the HUD and menus in an undistorted 16:9 box.
+ *
+ * @details
+ * Every HUD and menu tree is laid out in a virtual 1280x720 space and drawn through a HyScreen whose 2D
+ * offset and scale come from the UI screen table that the static initializer `FUN_00844dc0` builds at
+ * `0x017542cc` from the screen struct: offset `(boxW - 1280) / 2` at `+0x44`, x scale `boxW / 1280` at
+ * `+0x4c` (`0x01754318`) and y scale `boxH / 720` at `+0x50` (`0x0175431c`). The ShEnvServer constructor
+ * (`FUN_0056aea0`) copies them into the screens used by every scene context, and VlLoading
+ * (`FUN_005e6d30`), the UI model screens and the radar read them too. `FUN_0082a100` maps a virtual `x` to
+ * `px = W/2 + sx * (x + offx - W/2)`.
+ *
+ * With the full-width box the x scale is `W / 1280`, so the virtual 1280 units stretch across the whole
+ * ultrawide screen.
+ *
+ * How was this found?
+ * The table's last store is `fstp [0x0175431c]`, the y scale, right before `FUN_00844dc0` restores the SEH
+ * frame (`mov fs:[0], ecx`). `W169 / 1280 == H / 720` exactly, so copying the y scale into the x scale and
+ * keeping the offset `(W - 1280) / 2` gives `px = (W - W169) / 2 + x * H / 720`: the virtual space lands in a
+ * centered, undistorted 16:9 box. At 16:9 `W / 1280 == H / 720`, so the copy changes nothing. Patching the
+ * table before WinMain means every screen built from it gets the centered mapping, including the ones the
+ * game creates before its first loading screen.
+ *
+ * @return void
+ */
+void fixHud() {
+    Utils::SignatureHook hook {
+        .tag = __func__,
+        .signature = "DC 35 ?? ?? ?? ??    5E    5B    D9 1D ?? ?? ?? ??    64 89 0D 00 00 00 00    8B E5    5D    C3",
+        .offset = 0x0E
+    };
+    bool enable = yml.masterEnable && yml.hud;
+    if (enable) {
+        // The operand of `fstp [scaleY]` at +8, and of the table's `fild [boxW]; fdiv [1280.0]; fstp [scaleX]`.
+        uiTableScaleY = resolveOperand<f32>(hook.signature, 0x0A);
+        std::string xScaleSig = "DB 05 ?? ?? ?? ??    DC 35 ?? ?? ?? ??    D9 1D ?? ?? ?? ??    75";
+        uintptr_t xScale = Utils::patternScan(module.address, xScaleSig);
+        bool xScaleOk = xScale != 0 && screenStruct.boxWidth != nullptr &&
+            *reinterpret_cast<uintptr_t*>(xScale + 0x02) == reinterpret_cast<uintptr_t>(screenStruct.boxWidth) &&
+            *reinterpret_cast<f64*>(*reinterpret_cast<uintptr_t*>(xScale + 0x08)) == 1280.0;
+        f32* uiTableScaleX = xScaleOk ? *reinterpret_cast<f32**>(xScale + 0x0E) : nullptr;
+        enable = uiTableScaleY != nullptr && uiTableScaleX == uiTableScaleY - 1;
+        if (!enable) {
+            LOG("{} : The UI table's x scale is not right before its y scale; not hooked, the HUD stays stretched",
+                hook.tag);
+        }
+    }
+    // Every HUD position fix checks screen.hudCentred, which stays false unless this callback ran.
+    Utils::injectHook(enable, module, hook,
+        [](SafetyHookContext& ctx) {
+            if (!screen.ultrawide) {
+                return;
+            }
+            uiTableScaleY[-1] = uiTableScaleY[0];
+            screen.hudCentred = true;
+        }
+    );
+}
+
+/**
  * @brief Entry point for a DLL, called by the system when the DLL is loaded or unloaded.
  *
  * @details
@@ -599,6 +686,7 @@ BOOL APIENTRY DllMain(
             fixLargeAddressAware();
             fixDisplayMode();
             fixResolution();
+            fixHud();
         }
         catch (const std::exception& e) {
             spdlog::error("DllMain : {}; the fixes installed before this point stay active", e.what());

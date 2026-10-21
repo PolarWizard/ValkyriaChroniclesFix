@@ -11,3 +11,7 @@ resolution:
 
 # Runs the game in a borderless window instead of exclusive fullscreen.
 borderless: true
+
+# Unstretches, constrains, and centers the HUD and menus to 16:9.
+# Full screen fades, menu dimmers, screen effects and the 3D view still cover the whole screen.
+hud: true
