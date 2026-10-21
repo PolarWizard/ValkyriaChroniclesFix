@@ -700,6 +700,60 @@ void fixFullscreenBackgrounds() {
 }
 
 /**
+ * @brief Keeps scene fades and the black curtain covering the whole screen.
+ *
+ * @details
+ * VlSimpleFade (`FUN_00606f30`) draws a colored rect of `[0x017542d4] x [0x017542d8]` = 1280x720 virtual
+ * units centered on the fade position, (640, 360), and the ShProcessManager curtain (`FUN_0057ab00`) draws
+ * an opaque black quad from (0, 0) to (1280, 720). With the centered HUD the virtual 1280 units only cover the
+ * 16:9 box.
+ *
+ * How was this found?
+ * The fade's width is stored at `[esp+0x1c]` right before `FUN_00616df0` builds the rect (after the
+ * `push eax` at the hook). The curtain writes `0.0` to the vertex x at `[esp+0x30]`/`[esp+0x40]` and `1280.0`
+ * to `[esp+0x50]`/`[esp+0x60]` before `FUN_0082ecd0`.
+ *
+ * Why it works:
+ * The whole screen spans `1280 * W / W169` virtual units around the center at 640. Widening the fade to that
+ * and moving the curtain's edges to `640 -/+ 640 * W / W169` covers `[0, W]`.
+ *
+ * @return void
+ */
+void fixFades() {
+    Utils::SignatureHook fadeHook {
+        .tag = "fixFades (fade)",
+        .signature = "50    C7 44 24 28 02 00 00 00    89 54 24 24    E8",
+        .offset = 1
+    };
+    Utils::SignatureHook curtainHook {
+        .tag = "fixFades (curtain)",
+        .signature = "8D 44 24 30    6A 07    50    BF 02 00 00 00    E8",
+        .offset = 0
+    };
+    bool enable = yml.masterEnable && yml.hud;
+    Utils::injectHook(enable, module, fadeHook,
+        [](SafetyHookContext& ctx) {
+            if (!screen.hudCentred) {
+                return;
+            }
+            *reinterpret_cast<f32*>(ctx.esp + 0x1C) *= screen.width / screen.width169;
+        }
+    );
+    Utils::injectHook(enable, module, curtainHook,
+        [](SafetyHookContext& ctx) {
+            if (!screen.hudCentred) {
+                return;
+            }
+            f32 half = 640.0f * screen.width / screen.width169;
+            *reinterpret_cast<f32*>(ctx.esp + 0x30) = 640.0f - half;
+            *reinterpret_cast<f32*>(ctx.esp + 0x40) = 640.0f - half;
+            *reinterpret_cast<f32*>(ctx.esp + 0x50) = 640.0f + half;
+            *reinterpret_cast<f32*>(ctx.esp + 0x60) = 640.0f + half;
+        }
+    );
+}
+
+/**
  * @brief Entry point for a DLL, called by the system when the DLL is loaded or unloaded.
  *
  * @details
@@ -739,6 +793,7 @@ BOOL APIENTRY DllMain(
             fixResolution();
             fixHud();
             fixFullscreenBackgrounds();
+            fixFades();
         }
         catch (const std::exception& e) {
             spdlog::error("DllMain : {}; the fixes installed before this point stay active", e.what());
