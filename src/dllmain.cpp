@@ -66,7 +66,7 @@
 #include "utils.hpp"
 
 // Version string
-constexpr std::string VERSION = "1.0.1";
+constexpr std::string VERSION = "2.0.0";
 
 // .yml to struct
 typedef struct resolution_t {

@@ -61,7 +61,7 @@ set(CMAKE_GENERATOR_PLATFORM "Win32")
 set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)
 
 # Set the project name and version
-project(${PROJECT_NAME} VERSION 1.0)
+project(${PROJECT_NAME} VERSION 2.0)
 set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
