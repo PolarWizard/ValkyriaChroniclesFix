@@ -58,9 +58,16 @@
 constexpr std::string VERSION = "1.0.1";
 
 // .yml to struct
+typedef struct resolution_t {
+    i32 width;
+    i32 height;
+} resolution_t;
+
 typedef struct yml_t {
     std::string name;
     bool masterEnable;
+    resolution_t resolution;
+    bool borderless;
 } yml_t;
 
 // Globals
@@ -105,6 +112,39 @@ namespace {
         i32* squareHeight = nullptr;  ///< Render-target height `sqH` (+0x08).
         u32* guard = nullptr;
     } screenStruct;
+
+    /// A byte patch whose original bytes were matched by its signature, applied once the mode is known.
+    struct BytePatch {
+        uintptr_t address = 0;
+        std::vector<u8> bytes;
+    };
+    /// The launcher's "windowed" setting from `system_config.xml` (`0x01b940ac`), 1 for a windowed device.
+    i32* windowedSetting = nullptr;
+
+    /**
+     * @brief Reads a 4-byte absolute operand from the instruction bytes of a signature match.
+     *
+     * @param sig IDA-style signature to scan for.
+     * @param operandOffset Offset of the operand from the start of the match.
+     * @return T The operand as a pointer, or nullptr if the signature was not found.
+     */
+    template <typename T>
+    T* resolveOperand(std::string sig, uintptr_t operandOffset) {
+        uintptr_t addr = Utils::patternScan(module.address, sig);
+        return addr != 0 ? *reinterpret_cast<T**>(addr + operandOffset) : nullptr;
+    }
+
+    /**
+     * @brief Writes a byte patch.
+     */
+    void applyBytePatch(const BytePatch& patch) {
+        DWORD oldProtect;
+        LPVOID addr = reinterpret_cast<LPVOID>(patch.address);
+        VirtualProtect(addr, patch.bytes.size(), PAGE_EXECUTE_READWRITE, &oldProtect);
+        memcpy(addr, patch.bytes.data(), patch.bytes.size());
+        VirtualProtect(addr, patch.bytes.size(), oldProtect, &oldProtect);
+        FlushInstructionCache(GetCurrentProcess(), addr, patch.bytes.size());
+    }
 }
 
 /**
@@ -151,6 +191,11 @@ void logClose() {
 /**
  * @brief Reads and parses configuration settings from a YAML file.
  *
+ * @details
+ * `resolution` replaces the resolution the game runs at and `borderless` runs it in a borderless window (see
+ * `fixDisplayMode`).
+ * Every fix takes the width and height from the game's own state.
+ *
  * @return void
  */
 void readYml() {
@@ -160,6 +205,10 @@ void readYml() {
         yml.name = config["name"].as<std::string>("Valkyria Chronicles Fix");
 
         yml.masterEnable = config["masterEnable"].as<bool>(true);
+
+        yml.resolution.width = config["resolution"]["width"].as<i32>(0);
+        yml.resolution.height = config["resolution"]["height"].as<i32>(0);
+        yml.borderless = config["borderless"].as<bool>(true);
     }
     catch (const std::exception& e) {
         // A missing or malformed file must not take the game down at startup.
@@ -170,6 +219,10 @@ void readYml() {
 
     LOG("Name: {}", yml.name);
     LOG("MasterEnable: {}", yml.masterEnable);
+    LOG("-------------------------------------");
+    LOG("Resolution.Width: {}", yml.resolution.width);
+    LOG("Resolution.Height: {}", yml.resolution.height);
+    LOG("Borderless: {}", yml.borderless);
     LOG("-------------------------------------");
 }
 
@@ -277,6 +330,106 @@ void fixLargeAddressAware() {
             CloseHandle(process.hProcess);
             LOG("fixLargeAddressAware : Patched {:s} and restarted it", exe.string());
             TerminateProcess(GetCurrentProcess(), 0);
+        }
+    );
+}
+
+/**
+ * @brief Runs the game in a borderless window (`borderless`) and at the yml's `resolution`.
+ *
+ * @details
+ * The launcher writes a resolution and a "windowed" setting to `system_config.xml`, which `FUN_006de690` parses
+ * at the start of `FUN_00404340`. That function then loads the selected resolution at `0x004043e9` (ECX = width,
+ * ESI = height, 1280x720 when the config has none) and stores it in the screen struct, from which the game
+ * sizes everything else: the window (`FUN_00821360`, `FUN_00821110`), the D3D back buffer (`FUN_00825f10`) and
+ * the 16:9 box. WinMain parses the file again (`FUN_006dfe50`) before it creates the device, so the "windowed"
+ * setting is only final when the device creation reads it (`0x008050dd`: without it the creation flags get the
+ * fullscreen bit 0x40000000, an exclusive fullscreen device). The window style is applied by
+ * `FUN_00821110(andMask, orMask)`, which sets `(style & andMask) | orMask` and then sizes the window to exactly
+ * W x H, centered on the adapter's monitor. The game passes WS_POPUP | WS_VISIBLE | WS_SYSMENU for fullscreen and
+ * an overlapped window with a caption in windowed mode. It centers in the monitor's work area (`FUN_006e7bc0`
+ * copies `rcWork`), which puts a full-height window above the top edge by half the taskbar.
+ *
+ * How was this found?
+ * `CreateWindowExA` (`FUN_00821360`) and the only `SetWindowLongA` (`FUN_00821110`) both size the window from the
+ * screen struct's width and height, and `0x01b940ac` is referenced by exactly two instructions, `0x008050dd` and
+ * `0x00821a33`. Valkyria.exe's manifest declares it DPI aware, so the window size is in physical pixels.
+ *
+ * Why it works:
+ * Replacing the loaded resolution behaves exactly like choosing it in the launcher. Setting "windowed" right
+ * before the device reads it gives a windowed D3D device, forcing the game's own fullscreen style on every
+ * `FUN_00821110` call makes its window borderless, and centering in `rcMonitor` instead of `rcWork` puts it at
+ * the monitor's origin: W x H covering the whole screen at the desktop resolution. A smaller `resolution`, such as
+ * 21:9 on a 32:9 monitor, gives a centered borderless window.
+ *
+ * A `resolution` of 0 keeps the desktop's in borderless mode and the launcher's otherwise, so with `borderless`
+ * off and no `resolution` the game starts exactly as the launcher set it up.
+ *
+ * @return void
+ */
+void fixDisplayMode() {
+    Utils::SignatureHook sizeHook {
+        .tag = "fixDisplayMode (size)",
+        .signature = "8B 48 04    8B 30    EB 0A    B9 00 05 00 00    BE D0 02 00 00    8B DE    C1 E3 04",
+        .offset = 0x11
+    };
+    Utils::SignatureHook styleHook {
+        .tag = "fixDisplayMode (style)",
+        .signature = "6A FF    68 ?? ?? ?? ??    64 A1 00 00 00 00    50    83 EC 28    A1 ?? ?? ?? ??    33 C4    "
+                     "89 44 24 24    53    55    56",
+        .offset = 0
+    };
+    // `mov edi, [windowed]; sub edi, ebp; neg edi; sbb edi, edi; and edi, 0x40000000` before device creation.
+    Utils::SignatureHook windowedHook {
+        .tag = "fixDisplayMode (windowed)",
+        .signature = "8B 3D ?? ?? ?? ??    2B FD    F7 DF    1B FF    81 E7 00 00 00 40",
+        .offset = 0
+    };
+    bool resize = yml.borderless || yml.resolution.width > 0 || yml.resolution.height > 0;
+    bool enable = yml.masterEnable && resize;
+    if (enable && yml.borderless) {
+        windowedSetting = resolveOperand<i32>(windowedHook.signature, 0x02);
+        if (windowedSetting == nullptr) {
+            LOG("fixDisplayMode : Did not find the windowed setting; the game keeps its fullscreen mode");
+        }
+    }
+    bool borderless = enable && windowedSetting != nullptr;
+    // FUN_006e7bc0 copying the monitor's rcWork: `movq xmm0, [esp+0x1c]; movq [esi+0x2c], xmm0; movq xmm0, [esp+0x24]`.
+    // MONITORINFO is at esp+8, so rcMonitor is at esp+0x0c and esp+0x14.
+    std::string workAreaSig = "85 C0    75 2B    F3 0F 7E 44 24 1C    66 0F D6 46 2C    F3 0F 7E 44 24 24    66 0F D6 46 34    C6 06 01";
+    uintptr_t workArea = borderless ? Utils::patternScan(module.address, workAreaSig) : 0;
+    if (workArea != 0) {
+        applyBytePatch({ workArea + 0x09, { 0x0C } });
+        applyBytePatch({ workArea + 0x14, { 0x14 } });
+    }
+    else if (borderless) {
+        LOG("fixDisplayMode : Did not find the monitor rect lookup; the window stays centered in the work area");
+    }
+    Utils::injectHook(borderless, module, windowedHook,
+        [](SafetyHookContext& ctx) {
+            *windowedSetting = 1;
+        }
+    );
+    Utils::injectHook(enable, module, sizeHook,
+        [](SafetyHookContext& ctx) {
+            // 0 keeps the desktop resolution in a borderless window and the launcher's otherwise.
+            auto [desktopWidth, desktopHeight] = Utils::getDesktopDimensions();
+            i32 defaultWidth = yml.borderless ? static_cast<i32>(desktopWidth) : static_cast<i32>(ctx.ecx);
+            i32 defaultHeight = yml.borderless ? static_cast<i32>(desktopHeight) : static_cast<i32>(ctx.esi);
+            i32 w = yml.resolution.width > 0 ? yml.resolution.width : defaultWidth;
+            i32 h = yml.resolution.height > 0 ? yml.resolution.height : defaultHeight;
+            if (w > 0 && h > 0) {
+                ctx.ecx = static_cast<uintptr_t>(w);
+                ctx.esi = static_cast<uintptr_t>(h);
+            }
+        }
+    );
+    Utils::injectHook(borderless, module, styleHook,
+        [](SafetyHookContext& ctx) {
+            // At the entry: [esp] return address, [esp+4] andMask, [esp+8] orMask.
+            u32* args = reinterpret_cast<u32*>(ctx.esp);
+            args[1] = 0;
+            args[2] = WS_POPUP | WS_VISIBLE | WS_SYSMENU;
         }
     );
 }
@@ -444,6 +597,7 @@ BOOL APIENTRY DllMain(
         try {
             readYml();
             fixLargeAddressAware();
+            fixDisplayMode();
             fixResolution();
         }
         catch (const std::exception& e) {

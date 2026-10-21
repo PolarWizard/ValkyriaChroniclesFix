@@ -2,3 +2,12 @@ name: Valkyria Chronicles Fix
 
 # Enables or disables this mod.
 masterEnable: true
+
+# Resolution the game runs at. 0 uses the desktop resolution with borderless, else the launcher's.
+# A smaller size tries other aspect ratios in a centered borderless window, e.g. 5040x2160 for 21:9 at 2160p.
+resolution:
+  width: 0
+  height: 0
+
+# Runs the game in a borderless window instead of exclusive fullscreen.
+borderless: true
