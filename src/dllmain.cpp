@@ -134,10 +134,17 @@ namespace {
      * up front, from the pristine code.
      */
     struct Engine {
+        uintptr_t* sceneServer = nullptr;   ///< ShEnvServer singleton (`0x0198a33c`); screen B is at +0x94.
+        uintptr_t* currentEnv = nullptr;    ///< Current scene context (`0x01a7eed8`).
         f32* displaySize = nullptr;         ///< DisplayWidth, DisplayHeight (`0x01a7fc20`).
         uintptr_t* movie = nullptr;         ///< VlSimpleMovie instance (`0x01a3ba78`).
+        uintptr_t* talkCuts = nullptr;      ///< Talk cut camera manager (`0x01b83ffc`): envs rendered into talk cuts.
         IDirect3DDevice9** device = nullptr;    ///< The game's D3D9 device (`0x01b841d4`).
     } engine;
+
+    /// FUN_007f7190: appends a sprite quad to a 2D command, `(cmd, vertices, 4, 4, 0)`.
+    using EmitQuadFn = void(__cdecl*)(uintptr_t, void*, i32, i32, i32);
+    EmitQuadFn emitQuad = nullptr;
 
     /// A byte patch whose original bytes were matched by its signature, applied once the mode is known.
     struct BytePatch {
@@ -210,6 +217,68 @@ namespace {
         memcpy(addr, patch.bytes.data(), patch.bytes.size());
         VirtualProtect(addr, patch.bytes.size(), oldProtect, &oldProtect);
         FlushInstructionCache(GetCurrentProcess(), addr, patch.bytes.size());
+    }
+
+    /**
+     * @brief The pixel x at which a screen's 2D map puts virtual x = 0: `DW/2 + s * (offx - DW/2)`.
+     */
+    __forceinline f32 originX(uintptr_t scr) {
+        f32 dw = engine.displaySize[0];
+        return dw / 2.0f + *reinterpret_cast<f32*>(scr + 0x88) * (*reinterpret_cast<f32*>(scr + 0x80) - dw / 2.0f);
+    }
+
+    /**
+     * @brief The pixel y at which a screen's 2D map puts virtual y = 0.
+     */
+    __forceinline f32 originY(uintptr_t scr) {
+        f32 dh = engine.displaySize[1];
+        return dh / 2.0f + *reinterpret_cast<f32*>(scr + 0x8c) * (*reinterpret_cast<f32*>(scr + 0x84) - dh / 2.0f);
+    }
+
+    /**
+     * @brief Whether the talk system renders an env into a cut.
+     *
+     * @details
+     * `FUN_005d11b0` renders such an env into its cut of the canvas render target after overwriting the env's
+     * screen with the cut camera (viewport, zoom, 2D offset 0 and scale 1). Whatever was recorded for that env with
+     * the centered map, such as a talk picture overlay converted by `fixEffects2d`, is then drawn with the cut's
+     * pixel map instead. The envs are the list `[[0x01b83ffc]+0x64]` (env at +0, cut camera at +8, next at +0x28).
+     * Like the game, entries without a camera and the main env (`[[0x0198a33c]+0x80]`) are not cuts. A cut env
+     * can share its screen with the main env, so this goes by the env, never the screen.
+     */
+    __forceinline bool cutEnv(uintptr_t env) {
+        uintptr_t cuts = engine.talkCuts != nullptr ? *engine.talkCuts : 0;
+        uintptr_t server = engine.sceneServer != nullptr ? *engine.sceneServer : 0;
+        if (env == 0 || cuts == 0 || (server != 0 && env == *reinterpret_cast<uintptr_t*>(server + 0x80))) {
+            return false;
+        }
+        for (uintptr_t e = *reinterpret_cast<uintptr_t*>(cuts + 0x64); e != 0; e = *reinterpret_cast<uintptr_t*>(e + 0x28)) {
+            if (*reinterpret_cast<uintptr_t*>(e) == env) {
+                return *reinterpret_cast<uintptr_t*>(e + 0x08) != 0;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @brief Whether a HyScreen carries the centered 16:9 map that `fixHud` gives the UI screen table.
+     *
+     * @details
+     * True when its 2D scale is `H / 720` on both axes and its 2D origin lands at `((W - W169) / 2, 0)` with
+     * the live DisplayWidth/Height. It is false in vanilla, at 16:9 and narrower, with the HUD fix off, on
+     * pixel screens, during the offscreen passes that swap DisplayWidth and when `env`, the env the packet is
+     * drawn with (0 if unknown), is rendered into a talk cut (`cutEnv`), so hooks gated on it leave every other
+     * case exactly as the game draws it.
+     */
+    __forceinline bool centredMap(uintptr_t scr, uintptr_t env) {
+        if (scr == 0 || engine.displaySize == nullptr || !screen.hudCentred || cutEnv(env)) {
+            return false;
+        }
+        f32 s169 = screen.height / 720.0f;
+        f32 s = *reinterpret_cast<f32*>(scr + 0x88);
+        f32 t = *reinterpret_cast<f32*>(scr + 0x8c);
+        return std::fabs(s - s169) < 1e-3f && std::fabs(t - s169) < 1e-3f &&
+            std::fabs(originX(scr) - screen.offset169) < 1.0f && std::fabs(originY(scr)) < 1.0f;
     }
 
     /// A rectangle in back-buffer pixels.
@@ -1103,11 +1172,15 @@ void fixTalkPanels() {
  * @brief Locates the engine objects several fixes share, from the pristine code.
  *
  * @details
+ * - **Scene server and current scene context.** VlInterfaceDraw slots 25 and 26 (`FUN_005882e0`,
+ *   `FUN_00588300`) load the ShEnvServer singleton, read its env 1 and store it as the current context.
  * - **DisplayWidth/Height.** The X anchor resolver's `fld [DisplayWidth]`, read before `fixTextLayout`
  *   redirects that operand.
  * - **VlSimpleMovie** singleton, from the instruction that stores it.
+ * - **The talk cut camera manager**, from `FUN_005d11b0`'s lookup of the envs it renders into cuts.
  * - **The D3D9 device**, from the final composite's own `device->Clear` (vtable `+0xac`).
  * - **The save/load overlay's black quad helper** `FUN_00402f90`.
+ * - **FUN_007f7190**, which appends a sprite quad to a 2D command, from the HySprite layer emitter's call.
  *
  * A failure disables only the fixes that need that object, and is logged.
  *
@@ -1121,6 +1194,16 @@ void resolveShared() {
     auto operand = [](uintptr_t addr) { return *reinterpret_cast<uintptr_t*>(addr); };
     auto target = [](uintptr_t call) { return call + 5 + *reinterpret_cast<i32*>(call + 1); };
 
+    uintptr_t env = scan("A1 ?? ?? ?? ??    8B 88 84 00 00 00    89 0D ?? ?? ?? ??    C3    "
+                         "CC CC CC CC CC CC CC CC CC CC CC CC CC CC    A1 ?? ?? ?? ??    8B 80 84 00 00 00    56    A3");
+    if (env != 0 && operand(env + 0x01) == operand(env + 0x21) && operand(env + 0x0D) == operand(env + 0x2D)) {
+        engine.sceneServer = reinterpret_cast<uintptr_t*>(operand(env + 0x01));
+        engine.currentEnv = reinterpret_cast<uintptr_t*>(operand(env + 0x0D));
+    }
+    else {
+        LOG("Did not find the scene server and the current scene context");
+    }
+
     uintptr_t anchor = scan("A8 01    74 0A    D9 05 ?? ?? ?? ??    8B E5    5D    C3    D9 05 ?? ?? ?? ??    DC 0D");
     if (anchor != 0 && operand(anchor + 0x06) == operand(anchor + 0x10)) {
         engine.displaySize = reinterpret_cast<f32*>(operand(anchor + 0x06));
@@ -1131,6 +1214,13 @@ void resolveShared() {
 
     uintptr_t movie = scan("8D 86 B4 00 00 00    BF ?? ?? ?? ??    89 35 ?? ?? ?? ??    D9 5D FC");
     engine.movie = movie != 0 ? reinterpret_cast<uintptr_t*>(operand(movie + 0x0D)) : nullptr;
+
+    // FUN_005d11b0's cut lookup: `mov edx, [cuts]; test edx, edx; je; mov eax, [edx+0x64]; xor ecx, ecx; test eax, eax; je`.
+    uintptr_t cuts = scan("8B 15 ?? ?? ?? ??    85 D2    0F 84 ?? ?? ?? ??    8B 42 64    33 C9    85 C0    0F 84");
+    engine.talkCuts = cuts != 0 ? reinterpret_cast<uintptr_t*>(operand(cuts + 0x02)) : nullptr;
+    if (cuts == 0) {
+        LOG("Did not find the talk cut cameras");
+    }
 
     uintptr_t quad = scan("55    8B EC    D9 45 1C    83 EC 50    DC 0D ?? ?? ?? ??    56");
     uintptr_t quadCall = scan("56    57    52    50    E8 ?? ?? ?? ??    80 7C 24 27 00");
@@ -1150,6 +1240,15 @@ void resolveShared() {
     }
     else {
         LOG("Did not find the D3D9 device");
+    }
+
+    uintptr_t layer = scan("52    0B D9    56    89 9C 24 A8 00 00 00    E8 ?? ?? ?? ??    8B 7C 24 30");
+    uintptr_t emit = scan("8B 44 24 04    8B 40 04    83 EC 08    53    8B 5C 24 18    55    8B 6C 24 18    48    56    57    83 F8 0E");
+    if (layer != 0 && emit != 0 && target(layer + 0x0B) == emit) {
+        emitQuad = reinterpret_cast<EmitQuadFn>(emit);
+    }
+    else {
+        LOG("Did not find the sprite quad emitter");
     }
 }
 
@@ -1267,6 +1366,153 @@ void fixBookPageMesh() {
             f32 bias = screen.offset169 / (us * static_cast<f32>(*screenStruct.squareWidth));
             for (i32 i = 0; i < count; i++) {
                 source[4 * i] = source[4 * i] * scale + bias;
+            }
+        }
+    );
+}
+
+/// A HySprite vertex as the layer emitter writes it.
+struct SpriteVertex {
+    f32 x, y, z;
+    u32 color;  ///< ABGR.
+    f32 u, v;
+};
+
+/**
+ * @brief Extends full-screen sprite fills and the sniper-scope mask to the screen edges.
+ *
+ * @details
+ * Every VlInterface menu and HUD screen draws its 2D art as HySprite layers, each emitted as one quad in
+ * virtual 1280x720 units by `FUN_007e17d0`. With the centered HUD a layer meant to cover the screen covers only
+ * the 16:9 box. A census of every layer in the 292 sprite banks of the game and its DLC finds two kinds of
+ * full-width layers:
+ * - **Fills** (dimmers, fades, flashes, bands): they use a tiny atlas region (du <= 0.1875) or are tinted
+ *   black.
+ * - **Art** (the paper and briefing backgrounds, the training background): du >= 0.75. These stay 16:9.
+ * The one exception is the sniper-scope mask (`val_in_target.hsp` anim 4, layer 3): a full-texture 1280x720
+ * quad with a transparent round hole. It must cover the whole screen, but stretching it would make the hole an
+ * ellipse.
+ *
+ * How was this found?
+ * `call FUN_007f7190` (cmd, vertices) at `0x007e1d70` is the one point where a layer's corners and its world
+ * matrix (the current env's top matrix) are both known. Screen-space envs have bit 0x8000 set in
+ * `[[env+0x170]+0x30]`.
+ *
+ * Why it works:
+ * In a screen-space env with the centered map, the visible screen spans virtual `xl = 640 - 640 * W / W169` to
+ * `xr = 640 + 640 * W / W169`. A layer whose world rect spans 0..1280 (within 8 units):
+ * - **Fill** (du <= 0.2, or near-black and du < 0.7): its left and right edges move to `xl` and `xr`.
+ * - **Scope mask** (full UV, exactly 0..1280 x 0..720): two extra quads made of its edge texel column cover
+ *   `[xl, 0]` and `[1280, xr]`, so the hole keeps its shape.
+ * - **Art**: unchanged.
+ *
+ * @return void
+ */
+void fixFullscreenSprites() {
+    Utils::SignatureHook hook {
+        .tag = __func__,
+        .signature = "52    0B D9    56    89 9C 24 A8 00 00 00    E8 ?? ?? ?? ??    8B 7C 24 30",
+        .offset = 0x0B
+    };
+    bool enable = yml.masterEnable && yml.hud && emitQuad != nullptr &&
+        engine.currentEnv != nullptr && engine.displaySize != nullptr;
+    Utils::injectHook(enable, module, hook,
+        [](SafetyHookContext& ctx) {
+            uintptr_t env = *engine.currentEnv;
+            uintptr_t state = env != 0 ? *reinterpret_cast<uintptr_t*>(env + 0x170) : 0;
+            if (state == 0 || (*reinterpret_cast<u32*>(state + 0x30) & 0x8000) == 0) {
+                return;
+            }
+            uintptr_t scr = *reinterpret_cast<uintptr_t*>(env + 0x5C);
+            if (!centredMap(scr, env)) {
+                return;
+            }
+            f32 dw = engine.displaySize[0];
+            f32 center = dw / 2.0f - *reinterpret_cast<f32*>(scr + 0x80);
+            f32 half = dw / (2.0f * *reinterpret_cast<f32*>(scr + 0x88));
+            f32 xl = center - half;
+            f32 xr = center + half;
+            if (xl > -0.5f) {
+                return;
+            }
+            uintptr_t stack = *reinterpret_cast<uintptr_t*>(env + 0x1E0);
+            f32* m = stack != 0 ? *reinterpret_cast<f32**>(stack + 0x1C) : nullptr;
+            if (m == nullptr || std::fabs(m[1]) >= 1e-4f || std::fabs(m[4]) >= 1e-4f || !(m[0] > 1e-4f) || !(m[5] > 0.0f)) {
+                return;
+            }
+            uintptr_t cmd = *reinterpret_cast<uintptr_t*>(ctx.esp);
+            SpriteVertex* v = *reinterpret_cast<SpriteVertex**>(ctx.esp + 4);
+            f32 xw[4];
+            f32 yw[4];
+            for (u32 i = 0; i < 4; i++) {
+                xw[i] = v[i].x * m[0] + v[i].y * m[4] + v[i].z * m[8] + m[12];
+                yw[i] = v[i].x * m[1] + v[i].y * m[5] + v[i].z * m[9] + m[13];
+            }
+            f32 x0 = (std::min)((std::min)(xw[0], xw[1]), (std::min)(xw[2], xw[3]));
+            f32 x1 = (std::max)((std::max)(xw[0], xw[1]), (std::max)(xw[2], xw[3]));
+            std::array<u32, 2> left{};
+            std::array<u32, 2> right{};
+            u32 lefts = 0;
+            u32 rights = 0;
+            for (u32 i = 0; i < 4; i++) {
+                if (std::fabs(xw[i] - x0) < 0.5f && lefts < 2) {
+                    left[lefts++] = i;
+                }
+                else if (std::fabs(xw[i] - x1) < 0.5f && rights < 2) {
+                    right[rights++] = i;
+                }
+            }
+            if (lefts != 2 || rights != 2 || !(x0 <= 8.0f && x1 >= 1272.0f)) {
+                return;
+            }
+            auto localX = [m](f32 world, const SpriteVertex& p) { return (world - m[12] - p.y * m[4] - p.z * m[8]) / m[0]; };
+            f32 uL = (v[left[0]].u + v[left[1]].u) / 2.0f;
+            f32 uR = (v[right[0]].u + v[right[1]].u) / 2.0f;
+            f32 du = std::fabs(uR - uL);
+            f32 vMin = (std::min)((std::min)(v[0].v, v[1].v), (std::min)(v[2].v, v[3].v));
+            f32 vMax = (std::max)((std::max)(v[0].v, v[1].v), (std::max)(v[2].v, v[3].v));
+            f32 y0 = (std::min)((std::min)(yw[0], yw[1]), (std::min)(yw[2], yw[3]));
+            f32 y1 = (std::max)((std::max)(yw[0], yw[1]), (std::max)(yw[2], yw[3]));
+
+            bool mask = du >= 0.99f && vMax - vMin >= 0.99f && std::fabs(x0) < 1.0f && std::fabs(x1 - 1280.0f) < 1.0f &&
+                std::fabs(y0) < 1.0f && std::fabs(y1 - 720.0f) < 1.0f;
+            if (mask) {
+                std::array<SpriteVertex, 4> leftPad{};
+                std::array<SpriteVertex, 4> rightPad{};
+                for (u32 i = 0; i < 4; i++) {
+                    leftPad[i] = v[i];
+                    rightPad[i] = v[i];
+                    leftPad[i].u = uL + 0.002f * (uR - uL);
+                    rightPad[i].u = uR - 0.002f * (uR - uL);
+                }
+                for (u32 i : left) {
+                    leftPad[i].x = localX(xl, v[i]);
+                    rightPad[i].x = localX(x1, v[i]);
+                }
+                for (u32 i : right) {
+                    leftPad[i].x = localX(x0, v[i]);
+                    rightPad[i].x = localX(xr, v[i]);
+                }
+                emitQuad(cmd, leftPad.data(), 4, 4, 0);
+                emitQuad(cmd, rightPad.data(), 4, 4, 0);
+                return;
+            }
+
+            bool dark = true;
+            for (u32 i = 0; i < 4; i++) {
+                u32 c = v[i].color;
+                if ((c & 0xFF) > 2 || ((c >> 8) & 0xFF) > 2 || ((c >> 16) & 0xFF) > 2) {
+                    dark = false;
+                }
+            }
+            if (!(du <= 0.2f || (dark && du < 0.7f))) {
+                return;
+            }
+            for (u32 i : left) {
+                v[i].x = localX((std::min)(x0, xl - 1.0f), v[i]);
+            }
+            for (u32 i : right) {
+                v[i].x = localX((std::max)(x1, xr + 1.0f), v[i]);
             }
         }
     );
@@ -1597,6 +1843,7 @@ BOOL APIENTRY DllMain(
             fixCommandCursor();
             fixMovieBars();
             fixBookPageMesh();
+            fixFullscreenSprites();
         }
         catch (const std::exception& e) {
             spdlog::error("DllMain : {}; the fixes installed before this point stay active", e.what());
