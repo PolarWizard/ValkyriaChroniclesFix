@@ -649,6 +649,57 @@ void fixHud() {
 }
 
 /**
+ * @brief Moves the full-screen backgrounds of talk scenes and the book menu back onto the screen.
+ *
+ * @details
+ * Talk scenes with character portraits (VlTalkEventSystem and GameEndSystem, both through `FUN_00647650`)
+ * draw a capture of the 3D frame behind the portraits, and the book menu (EsdInterfaceMainDraw, through
+ * `FUN_0059a0f0`) draws its background render target. Both build a quad of `boxW x boxH` pixels, scale it by
+ * `1 / sx` and `1 / sy` (`fld [0x01754318]`, `fdiv [0x0175431c]` into a scale matrix) and draw it through the
+ * current scene context's HyScreen. That cancels the 2D scale but not the 2D offset, so on screen the quad
+ * starts at `D = sx * (offx - W/2) + W/2`: 0 with the stock mapping, `(W - W169) / 2` with the centered HUD.
+ *
+ * How was this found?
+ * At the draw call the four vertices are `{x, y, z, color, u, v}` with a stride of `0x18`, at `[esp+0x40]` in
+ * `FUN_00647650` and `[esp+0x34]` in `FUN_0059a0f0` (`lea edx, [esp+...]; push 9; push edx` before
+ * `FUN_0082ebd0`). The shift matches the reported 1280 px at 5120x1440, where `D = (5120 - 2560) / 2`.
+ *
+ * Why it works:
+ * Subtracting `D` from each vertex x makes the quad cover exactly `[0, W]`, which is what the capture holds.
+ *
+ * @return void
+ */
+void fixFullscreenBackgrounds() {
+    Utils::SignatureHook talkHook {
+        .tag = "fixFullscreenBackgrounds (talk)",
+        .signature = "83 C4 04    8D 54 24 40    6A 09    52    BF 02 00 00 00    E8",
+        .offset = 3
+    };
+    Utils::SignatureHook bookHook {
+        .tag = "fixFullscreenBackgrounds (book)",
+        .signature = "E8 ?? ?? ?? ??    8D 54 24 34    6A 09    52    33 FF    E8",
+        .offset = 5
+    };
+    bool enable = yml.masterEnable && yml.hud;
+    Utils::injectHook(enable, module, talkHook,
+        [](SafetyHookContext& ctx) {
+            f32 shift = hudOffset();
+            for (u32 i = 0; i < 4; i++) {
+                *reinterpret_cast<f32*>(ctx.esp + 0x40 + i * 0x18) -= shift;
+            }
+        }
+    );
+    Utils::injectHook(enable, module, bookHook,
+        [](SafetyHookContext& ctx) {
+            f32 shift = hudOffset();
+            for (u32 i = 0; i < 4; i++) {
+                *reinterpret_cast<f32*>(ctx.esp + 0x34 + i * 0x18) -= shift;
+            }
+        }
+    );
+}
+
+/**
  * @brief Entry point for a DLL, called by the system when the DLL is loaded or unloaded.
  *
  * @details
@@ -687,6 +738,7 @@ BOOL APIENTRY DllMain(
             fixDisplayMode();
             fixResolution();
             fixHud();
+            fixFullscreenBackgrounds();
         }
         catch (const std::exception& e) {
             spdlog::error("DllMain : {}; the fixes installed before this point stay active", e.what());
