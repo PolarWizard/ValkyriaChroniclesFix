@@ -975,6 +975,45 @@ void fixHudModels() {
 }
 
 /**
+ * @brief Stops the command mode camera from scrolling past the top and bottom map edges.
+ *
+ * @details
+ * `FUN_00513850` (SlgCommandCursor) sets the camera clamp margins from the FOV: the X extent
+ * `[esi+0xe8] = 2 * d * tan(fov / 2)` and the Z extent `[esi+0xec] = [esi+0xe8] * vpH / vpW`. It treats the
+ * vertical FOV as horizontal, so the Z extent follows the screen aspect: at 32:9 it is half its 16:9 value and
+ * the camera scrolls further toward the top and bottom map edges.
+ *
+ * How was this found?
+ * The two fields are written only by the cursor constructor and `FUN_00513850`, and read only by
+ * `FUN_005130b0`, right after it calls `FUN_00513850` (`fld [esi+0xe8]` ... `fld [esi+0xec]`), to build the clamp
+ * box `[min + e/2, max - e/2]`.
+ *
+ * Why it works:
+ * Raising the Z extent to `[esi+0xe8] * 9 / 16` before it is read gives exactly the 16:9 margin. The X margin
+ * is left as is: the wider screen shows more past the left and right map edges at the scroll limits.
+ *
+ * @return void
+ */
+void fixCommandCursor() {
+    Utils::SignatureHook hook {
+        .tag = __func__,
+        .signature = "D9 86 E8 00 00 00    DD 05 ?? ?? ?? ??    DC C9    D9 C9    D9 5D FC    D9 86 EC 00 00 00",
+        .offset = 0
+    };
+    bool enable = yml.masterEnable;
+    Utils::injectHook(enable, module, hook,
+        [](SafetyHookContext& ctx) {
+            if (!screen.ultrawide) {
+                return;
+            }
+            f32 extentX = *reinterpret_cast<f32*>(ctx.esi + 0xE8);
+            f32& extentZ = *reinterpret_cast<f32*>(ctx.esi + 0xEC);
+            extentZ = (std::max)(extentZ, extentX * 9.0f / 16.0f);
+        }
+    );
+}
+
+/**
  * @brief Renders the talk scene portrait panels at the 16:9 scale.
  *
  * @details
@@ -1417,6 +1456,7 @@ BOOL APIENTRY DllMain(
             fixRadar();
             fixSaveLoad();
             fixGrassCulling();
+            fixCommandCursor();
         }
         catch (const std::exception& e) {
             spdlog::error("DllMain : {}; the fixes installed before this point stay active", e.what());
