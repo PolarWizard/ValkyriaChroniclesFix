@@ -60,6 +60,7 @@
 #include <vector>
 #include <bit>
 #include <cstring>
+#include <d3d9.h>
 
 // Local includes
 #include "utils.hpp"
@@ -134,6 +135,8 @@ namespace {
      */
     struct Engine {
         f32* displaySize = nullptr;         ///< DisplayWidth, DisplayHeight (`0x01a7fc20`).
+        uintptr_t* movie = nullptr;         ///< VlSimpleMovie instance (`0x01a3ba78`).
+        IDirect3DDevice9** device = nullptr;    ///< The game's D3D9 device (`0x01b841d4`).
     } engine;
 
     /// A byte patch whose original bytes were matched by its signature, applied once the mode is known.
@@ -1102,6 +1105,8 @@ void fixTalkPanels() {
  * @details
  * - **DisplayWidth/Height.** The X anchor resolver's `fld [DisplayWidth]`, read before `fixTextLayout`
  *   redirects that operand.
+ * - **VlSimpleMovie** singleton, from the instruction that stores it.
+ * - **The D3D9 device**, from the final composite's own `device->Clear` (vtable `+0xac`).
  * - **The save/load overlay's black quad helper** `FUN_00402f90`.
  *
  * A failure disables only the fixes that need that object, and is logged.
@@ -1124,6 +1129,9 @@ void resolveShared() {
         LOG("Did not find DisplayWidth");
     }
 
+    uintptr_t movie = scan("8D 86 B4 00 00 00    BF ?? ?? ?? ??    89 35 ?? ?? ?? ??    D9 5D FC");
+    engine.movie = movie != 0 ? reinterpret_cast<uintptr_t*>(operand(movie + 0x0D)) : nullptr;
+
     uintptr_t quad = scan("55    8B EC    D9 45 1C    83 EC 50    DC 0D ?? ?? ?? ??    56");
     uintptr_t quadCall = scan("56    57    52    50    E8 ?? ?? ?? ??    80 7C 24 27 00");
     if (quad != 0 && quadCall != 0 && target(quadCall + 0x04) == quad) {
@@ -1132,6 +1140,81 @@ void resolveShared() {
     else {
         LOG("Did not find the black quad helper");
     }
+
+    // The final composite blanks the back buffer with `mov eax, [device]; ... push 0xff000000; push 7; push 0; push 0;
+    // push eax; mov eax, [edx+0xac]; call eax`: Clear(0, nullptr, target | depth | stencil, black, z, 0).
+    uintptr_t clear = scan("A1 ?? ?? ?? ??    D9 45 E4    8B 10    57    51    33 FF    D9 1C 24    68 00 00 00 FF    6A 07    "
+                           "57    57    50    8B 82 AC 00 00 00    FF D0");
+    if (clear != 0) {
+        engine.device = reinterpret_cast<IDirect3DDevice9**>(operand(clear + 0x01));
+    }
+    else {
+        LOG("Did not find the D3D9 device");
+    }
+}
+
+/**
+ * @brief Draws black bars beside movies in the final composite.
+ *
+ * @details
+ * The final composites (`FUN_0056c2c0` and its copy `FUN_00584610`) clear the back buffer, draw the scene
+ * render target over it and then the PC save/load overlay. With the full-width box the scene covers the whole
+ * screen, so a movie has nothing at its sides but whatever the scene drew there. Every gameplay movie (OPENING,
+ * STAFFROLL, EV*) plays through VlSimpleMovie, which draws a 1280x720 virtual quad that the centered HUD puts in
+ * the 16:9 box. It plays while `[movie+0x84]` and `[movie+0x94]` are set.
+ *
+ * Everything else keeps the full width. (Talk scenes could be framed the same way, gated on VlTalkEventSystem's
+ * `+0x2f8` "talk sequence running" flag; the book menu needs no bars, its page targets are black outside the
+ * spread.)
+ *
+ * How was this found?
+ * Both composites load `mov edx, [0x0198a3c4]` right after the scene quad call and before the overlay, with an
+ * empty x87 stack and the full back-buffer viewport still set. A few instructions earlier they blank the whole
+ * back buffer with `device->Clear(0, nullptr, 7, 0xff000000, z, 0)`.
+ *
+ * Why it works:
+ * The 3D is Hor+ with its center at `W / 2`, so the middle `W169` columns are exactly the vanilla 16:9 image.
+ * Clearing `[0, OX)` and `[OX + W169, W)` to black with the same call, limited to those two rectangles, reproduces
+ * the vanilla framing. Clear sets no render state, so the game's state tracking is untouched.
+ *
+ * @return void
+ */
+void fixMovieBars() {
+    Utils::SignatureHook composite {
+        .tag = "fixMovieBars (composite)",
+        .signature = "D9 1C 24    E8 ?? ?? ?? ??    8B 15 ?? ?? ?? ??    8B 04 95 ?? ?? ?? ??    33 F6    3B C7",
+        .offset = 8
+    };
+    Utils::SignatureHook composite2 {
+        .tag = "fixMovieBars (composite 2)",
+        .signature = "D9 1C 24    E8 ?? ?? ?? ??    8B 15 ?? ?? ?? ??    8B 04 95 ?? ?? ?? ??    83 C4 20    33 F6    3B C7",
+        .offset = 8
+    };
+    bool enable = yml.masterEnable && engine.movie != nullptr && engine.device != nullptr;
+    auto bars = [](SafetyHookContext& ctx) {
+        if (!screen.ultrawide) {
+            return;
+        }
+        // Movies are centered by the HUD fix; without it they are stretched over the full width.
+        uintptr_t movie = engine.movie != nullptr ? *engine.movie : 0;
+        bool playing = screen.hudCentred && movie != 0 &&
+            *reinterpret_cast<i32*>(movie + 0x84) != 0 && *reinterpret_cast<uintptr_t*>(movie + 0x94) != 0;
+        if (!playing) {
+            return;
+        }
+        IDirect3DDevice9* device = *engine.device;
+        LONG w = static_cast<LONG>(screen.width);
+        LONG h = static_cast<LONG>(screen.height);
+        LONG left = static_cast<LONG>(std::floor(screen.offset169));
+        LONG right = static_cast<LONG>(std::ceil(screen.offset169 + screen.width169));
+        if (device == nullptr || left <= 0) {
+            return;
+        }
+        D3DRECT rects[2] = { { 0, 0, left, h }, { right, 0, w, h } };
+        device->Clear(2, rects, D3DCLEAR_TARGET, D3DCOLOR_ARGB(0xFF, 0, 0, 0), 1.0f, 0);
+    };
+    Utils::injectHook(enable, module, composite, bars);
+    Utils::injectHook(enable, module, composite2, bars);
 }
 
 /**
@@ -1457,6 +1540,7 @@ BOOL APIENTRY DllMain(
             fixSaveLoad();
             fixGrassCulling();
             fixCommandCursor();
+            fixMovieBars();
         }
         catch (const std::exception& e) {
             spdlog::error("DllMain : {}; the fixes installed before this point stay active", e.what());
