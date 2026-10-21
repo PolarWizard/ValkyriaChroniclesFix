@@ -6,6 +6,7 @@ Adds support for ultrawide resolutions and additional features.
 ***This project is designed exclusively for Windows due to its reliance on Windows-specific APIs. The build process requires the use of PowerShell.***
 
 ## Fixes
+- Support for ultrawide resolutions
 
 ## Build and Install
 ### Using CMake
