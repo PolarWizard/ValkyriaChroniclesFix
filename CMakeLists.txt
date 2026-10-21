@@ -20,20 +20,42 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-cmake_minimum_required(VERSION 3.28)
+cmake_minimum_required(VERSION 4.2)
 
 # Variables
 set(PROJECT_NAME ValkyriaChroniclesFix)
-# set(DEFAULT_GAME_FOLDER "C:/Program Files (x86)/Steam/steamapps/common/Valkyria Chronicles")
-set(DEFAULT_GAME_FOLDER "C:/Program Files (x86)/Steam/steamapps/common/Valkyria Chronicles")
-set(GAME_FOLDER "${DEFAULT_GAME_FOLDER}" CACHE STRING "User specified path to game folder")
-if (EXISTS "${GAME_FOLDER}/Valkyria.exe")
-    message(STATUS "Game folder: ${GAME_FOLDER}")
+
+set(INSTALL_PATH_OK false)
+if(DEFINED CMAKE_INSTALL_PREFIX AND NOT CMAKE_INSTALL_PREFIX STREQUAL "")
+    if(NOT EXISTS ${CMAKE_INSTALL_PREFIX})
+        message(FATAL_ERROR "Install path '${CMAKE_INSTALL_PREFIX}' does not exist")
+    else()
+        set(VALID_EXES "Valkyria.exe")
+        foreach(EXE ${VALID_EXES})
+            if(EXISTS "${CMAKE_INSTALL_PREFIX}/${EXE}")
+                set(INSTALL_PATH_OK true)
+                message(STATUS "Path: '${CMAKE_INSTALL_PREFIX}' yields valid game exe: '${EXE}'")
+            endif()
+        endforeach()
+
+        if(NOT INSTALL_PATH_OK)
+            message(WARNING
+                "Provided install path is unexpected: '${CMAKE_INSTALL_PREFIX}'\n"
+                "The path does not contain any of the following valid game exe's: ${VALID_EXES}\n"
+                "Will use anyway during installation... but are you sure this is correct?"
+            )
+            set(INSTALL_PATH_OK true)
+        endif()
+    endif()
 else()
-    message(FATAL_ERROR "Bad game folder provided: ${GAME_FOLDER}")
+    set(CMAKE_INSTALL_PREFIX "" CACHE PATH "Path to game folder" FORCE)
+    message(WARNING
+        "Install path not specified! Using 'cmake --install' will NOT work!\n"
+        "If this is a mistake reconfigure using: '-DCMAKE_INSTALL_PREFIX=<path-to-game-folder>'\n"
+    )
 endif()
 
-# Force compilation of 32bit DLL
+# Valkyria.exe is a 32-bit process, the DLL loaded into it must be 32-bit too.
 set(CMAKE_GENERATOR_PLATFORM "Win32")
 # Force all MSVC Runtimes to be linked statically into DLL
 set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)
@@ -42,55 +64,47 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)
 project(${PROJECT_NAME} VERSION 1.0)
 set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
-# Define the common output directory
-set(OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+    message(FATAL_ERROR
+        "Valkyria.exe is 32-bit, but this build uses ${CMAKE_SIZEOF_VOID_P}-byte pointers.\n"
+        "Reconfigure from a clean build folder with: 'cmake -A Win32 ..'"
+    )
+endif()
 
-# Configure debug and release directories separately
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG ${OUTPUT_DIRECTORY}/Debug)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${OUTPUT_DIRECTORY}/Release)
+add_library(${PROJECT_NAME} SHARED)
 
-add_definitions(-DUNICODE -D_UNICODE)
-
-# Add executable
-# set(SOURCE_FILES src/main.cpp src/utils.cpp)
-# add_executable(${PROJECT_NAME}_exe ${SOURCE_FILES})
-# target_link_libraries(${PROJECT_NAME}_exe PRIVATE
-#     Zydis
-#     yaml-cpp
-#     safetyhook
-# )
-# target_include_directories(${PROJECT_NAME}_exe PRIVATE
-#     inc
-#     spdlog/include
-#     yaml-cpp/include
-#     safetyhook/include
-# )
+# Include dependencies via FetchContent
+include(cmake/Dependencies.cmake)
 
 # Add DLL
-set(DLL_FILES src/dllmain.cpp src/utils.cpp)
-add_library(${PROJECT_NAME} SHARED ${DLL_FILES})
+target_sources(${PROJECT_NAME} PRIVATE src/dllmain.cpp src/utils.cpp)
+
+# C++23 for std::format, std::span and designated initializers
+target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_23)
+
+# Add /utf-8 flag for MSVC
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE "/utf-8")
+endif()
+
+# Include directories
+target_include_directories(${PROJECT_NAME} PRIVATE inc)
+
+# Link dependencies
 target_link_libraries(${PROJECT_NAME} PRIVATE
     Zydis
-    yaml-cpp
     safetyhook
-)
-target_include_directories(${PROJECT_NAME} PRIVATE
-    inc
-    spdlog/include
-    yaml-cpp/include
-    safetyhook/include
+    spdlog::spdlog
+    yaml-cpp
 )
 
-# Add directory and build
-add_subdirectory(yaml-cpp EXCLUDE_FROM_ALL)
-add_subdirectory(zydis EXCLUDE_FROM_ALL)
-add_subdirectory(safetyhook EXCLUDE_FROM_ALL)
-
-install(CODE "
-    execute_process(
-        COMMAND
-            powershell.exe
-                -ExecutionPolicy Bypass
-                -File \"${CMAKE_SOURCE_DIR}/install.ps1\" \"${GAME_FOLDER}\"
-    )
-")
+if(INSTALL_PATH_OK)
+    install(CODE "
+        execute_process(
+            COMMAND
+                powershell.exe
+                    -ExecutionPolicy Bypass
+                    -File \"${CMAKE_SOURCE_DIR}/install.ps1\" \"${CMAKE_INSTALL_PREFIX}\"
+        )
+    ")
+endif()

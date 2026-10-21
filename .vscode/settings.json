@@ -1,0 +1,17 @@
+{
+    "C_Cpp.default.compilerPath": "${env:VCToolsInstallDir}bin\\Hostx64\\x86\\cl.exe",
+    "C_Cpp.default.includePath": [
+        "${workspaceFolder}/**",
+        "${env:VCToolsInstallDir}include",
+        "${env:VCToolsInstallDir}atlmfc\\include",
+        "${env:WindowsSdkDir}Include\\${env:WindowsSdkVersion}\\ucrt",
+        "${env:WindowsSdkDir}Include\\${env:WindowsSdkVersion}\\um",
+        "${env:WindowsSdkDir}Include\\${env:WindowsSdkVersion}\\shared"
+    ],
+    "C_Cpp.default.defines": [
+        "_DEBUG",
+        "UNICODE"
+    ],
+    "C_Cpp.default.cppStandard": "c++23",
+    "C_Cpp.default.intelliSenseMode": "msvc-x86"
+}

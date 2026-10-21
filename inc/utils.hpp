@@ -1,7 +1,7 @@
 /*
  * MIT License
  *
- * Copyright (c) 2024 Dominik Protasewicz
+ * Copyright (c) 2025 Dominik Protasewicz
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,14 +27,58 @@
 #include <windows.h>
 #include <vector>
 #include <string>
+#include <cstdint>
+#include <span>
+
+// 3rd party includes
+#include "spdlog/spdlog.h"
+#include "spdlog/sinks/basic_file_sink.h"
+#include "yaml-cpp/yaml.h"
+#include "safetyhook.hpp"
+
+#define LOG(STRING, ...) spdlog::info("{} : " STRING, __func__, ##__VA_ARGS__)
+
+namespace
+{
+    typedef uint8_t  u8;
+    typedef uint16_t u16;
+    typedef uint32_t u32;
+    typedef uint64_t u64;
+    typedef int8_t   i8;
+    typedef int16_t  i16;
+    typedef int32_t  i32;
+    typedef int64_t  i64;
+    typedef float    f32;
+    typedef double   f64;
+}
 
 namespace Utils
 {
+    struct ModuleInfo {
+        HMODULE address{};
+        std::string name{};
+        explicit ModuleInfo(HMODULE address) : address(address) {}
+    };
+
+    struct SignatureHook {
+        std::string tag{};
+        std::string signature{};
+        uintptr_t offset{};
+    };
+
+    struct SignaturePatch {
+        std::string tag{};
+        std::string signature{};
+        uintptr_t signatureOffset{};
+        std::string patch{};
+        uintptr_t patchOffset{};
+    };
+
     /**
      * @brief Retrieves information about the compiler being used.
      * @details This function returns a string containing the name and version of the
-     * compiler. It checks for several well-known compilers and formats the version
-     * information accordingly:
+     *      compiler. It checks for several well-known compilers and formats the version
+     *      information accordingly:
      *
      * - **GCC:** The version is formatted as "GCC - major.minor.patch".
      * - **Clang:** The version is formatted as "Clang - major.minor.patch".
@@ -46,65 +90,202 @@ namespace Utils
     std::string getCompilerInfo();
 
     /**
-     * @brief Convert memory bytes into string representation
-     * @details Converts the bytes pointed to by the `bytes` parameter into a string.
-     *      The total number of bytes that will be converted is based on the `size`
-     *      parameter. The returned string will be in hexidecimal format and will be
-     *      organized as the bytes appear in memory. For example, if the `bytes` parameter
-     *      points to some integer in memory equal to `0x12345678`, and the `size` parameter
-     *      is given sizeof(int), then the returned string shall be "78 56 34 12", as that is
-     *      how `0x12345678` is stored in memory, on little endian x86_64.
+     * @brief Converts memory bytes into string representation.
+     * @details Converts the bytes referenced by the `bytes` parameter into a IDA-style byte string.
+     *      The output is formatted as space-separated byte values, appearing in the same order
+     *      as they exist in memory. For example, if an integer `0x12345678` is passed the
+     *      function returns `"78 56 34 12"` on a little-endian system.
      *
-     * @param bytes Pointer to memory
-     * @param size Size of `bytes` parameter
-     * @return std::string
+     * @param bytes A span of bytes representing the memory region.
+     * @return std::string containing the IDA-style byte string.
      *
      * @code
      * float a = 3.5555556; // In hex: 0x40638E39
-     * std::string string = bytesToString(&a, sizeof(float));
-     * std::cout << string << std::endl; // Prints "39 8E 63 40"
+     * std::string myString = bytesToString(std::as_bytes(std::span{&value, 1}));
+     * std::cout << myString << std::endl; // Prints "39 8E 63 40"
+     *
+     * std::vector<u8> data = {0x40, 0x63, 0x8E, 0x39};
+     * std::string myString = bytesToString(data);
+     * std::cout << myString << std::endl; // Prints "40 63 8E 39"
      * @endcode
      */
-    std::string bytesToString(void* bytes, size_t size);
+    std::string bytesToString(std::span<const u8> bytes);
 
     /**
-     * @brief Get the width and height, respectively, of the desktop in pixels
+     * @brief Get the width and height of the desktop in pixels.
      *
-     * @return std::pair<int, int>
+     * @return std::pair<u32, u32> containing the width and height.
      */
-    std::pair<int, int> GetDesktopDimensions();
+    std::pair<u32, u32> getDesktopDimensions();
 
     /**
-     * @brief Patch an area of memory with a pattern
-     * @details Patches an area of memory pointed to by `address` with the pattern.
-     *      The `pattern` parameter is expected to be in the form of a hex string as such:
-     *      "DE AD BE EF". There is no limit is how long the pattern string can be, but
-     *      it is important to be mindful as to not go out of bounds of the program space
-     *      else a segmentation fault will occur. The total amount of memory that will
-     *      be patched is determined by the size of the `pattern` parameter. If the example
-     *      hex string above is referenced then the total amount of memory that will be
-     *      patched is 4 bytes, starting at the address[0] and ending at the address[3].
+     * @brief Patch an area of memory with a pattern.
+     * @details Overwrites memory at `address` using the provided pattern. The `pattern`
+     *      must be formatted as a space-separated hex string (e.g., `"DE AD BE EF"`).
+     *      The function modifies memory at the specified address, spanning the number
+     *      of bytes determined by the pattern length. Proper care should be taken to
+     *      avoid segmentation faults or corruption of unintended memory regions.
      *
-     * @param address Starting memory address
-     * @param pattern IDA-style byte array pattern
+     * @param address Memory address to patch.
+     * @param pattern IDA-style byte array pattern.
      */
-    void patch(uintptr_t address, const char* pattern);
+    void patch(uintptr_t address, std::string& pattern);
 
     /**
-     * @brief Scan for a given byte pattern on a module
-     * @details Obtained and modified from:
-     *      https://github.com/OneshotGH/CSGOSimple-master/blob/master/CSGOSimple/helpers/utils.cpp
-     *      Original implementation is for the most part intact. Modified so that all
-     *      the addresses where the pattern is found is appended to the `address` vector,
-     *      instead of returning the address when the first instance is found.
+     * @brief Scan for a given byte pattern in a module.
+     * @details Searches the specified module's memory for occurrences of the given
+     *      IDA-style byte pattern. Each match is appended to the `address` vector.
+     *      Wildcard bytes ("??") can be used to match any byte in the pattern.
      *
-     * @param module Base of the module to search
-     * @param signature IDA-style byte array pattern
-     * @param address Vector of addresses where the pattern was found
+     * @param module Base address of the module to scan.
+     * @param signature IDA-style byte array pattern.
+     * @param address Vector to store found addresses.
+     *
+     * @return uintptr_t containing the address of the first hit if the signature is
+     *      found else 0.
      */
-    void patternScan(void* module, const char* signature, std::vector<uint64_t>* address);
+    uintptr_t patternScan(void* module, std::string& signature);
 
-    DWORD findProcessID(const char* targetProcess);
-    void suspendAllThreads();
-    void resumeAllThreads();
+    /**
+     * @brief Injects a mid-function hook based on a signature pattern match.
+     *
+     * @tparam Func The type of the callback function.
+     * @param enable If true, the hook will be injected; otherwise, it is skipped.
+     * @param module The module to scan for the signature.
+     * @param sh The signature pattern and offset information for the hook.
+     * @param callback The function to execute when the hook is triggered.
+     * @return true if the hook was installed.
+     *
+     * @details
+     * This function scans the specified module for the given signature pattern.
+     * If a match is found, it calculates the absolute and relative addresses,
+     * logs the location, and applies a mid-function hook at the computed address.
+     *
+     * @note This function only hooks the first match found in the module.
+     *
+     * @see Utils::patternScan
+     */
+    template <typename Func>
+    bool injectHook(bool enable, Utils::ModuleInfo& module, Utils::SignatureHook& sh, Func&& callback) {
+        if (enable) {
+            uintptr_t addr = Utils::patternScan(module.address, sh.signature);
+            if (addr != 0) {
+                uintptr_t hit = addr;
+                uintptr_t absAddr = hit;
+                uintptr_t relAddr = hit - reinterpret_cast<uintptr_t>(module.address);
+                spdlog::info("{} : Found '{}' @ {:s}+{:x}", sh.tag, sh.signature, module.name, relAddr);
+                uintptr_t hookAbsAddr = absAddr + sh.offset;
+                uintptr_t hookRelAddr = relAddr + sh.offset;
+                static std::vector<SafetyHookMid> hooks;
+                SafetyHookMid hook = safetyhook::create_mid(
+                    reinterpret_cast<void*>(hookAbsAddr),
+                    callback
+                );
+                bool hooked = static_cast<bool>(hook);
+                hooks.push_back(std::move(hook));
+                if (hooked) {
+                    spdlog::info("{} : Hooked @ {:s}+{:x}", sh.tag, module.name, hookRelAddr);
+                }
+                else {
+                    spdlog::info("{} : Failed to hook @ {:s}+{:x}", sh.tag, module.name, hookRelAddr);
+                }
+                return hooked;
+            }
+            else {
+                spdlog::info("{} : Did not find '{}'", sh.tag, sh.signature);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @brief Injects an inline hook, replacing a whole function, based on a signature pattern match.
+     *
+     * @tparam Func The type of the detour function pointer.
+     * @param enable If true, the hook will be injected; otherwise, it is skipped.
+     * @param module The module to scan for the signature.
+     * @param sh The signature pattern and offset information for the hook.
+     * @param hook Receives the hook, the detour calls the original function through it.
+     * @param detour The function that runs in place of the hooked function.
+     *
+     * @details
+     * This function scans the specified module for the given signature pattern.
+     * If a match is found, it calculates the absolute and relative addresses,
+     * logs the location, and applies an inline hook at the computed address.
+     *
+     * The hook is created disabled, moved into `hook` and only then enabled. The game keeps running while
+     * hooks are injected, so this guarantees that the detour never runs before `hook` holds the trampoline
+     * that the detour uses to call the original function.
+     *
+     * @note This function only hooks the first match found in the module.
+     *
+     * @see Utils::patternScan
+     */
+    template <typename Func>
+    void injectInlineHook(bool enable, Utils::ModuleInfo& module, Utils::SignatureHook& sh, SafetyHookInline& hook, Func detour) {
+        if (enable) {
+            uintptr_t addr = Utils::patternScan(module.address, sh.signature);
+            if (addr != 0) {
+                uintptr_t hit = addr;
+                uintptr_t absAddr = hit;
+                uintptr_t relAddr = hit - reinterpret_cast<uintptr_t>(module.address);
+                spdlog::info("{} : Found '{}' @ {:s}+{:x}", sh.tag, sh.signature, module.name, relAddr);
+                uintptr_t hookAbsAddr = absAddr + sh.offset;
+                uintptr_t hookRelAddr = relAddr + sh.offset;
+                hook = safetyhook::create_inline(
+                    reinterpret_cast<void*>(hookAbsAddr),
+                    reinterpret_cast<void*>(detour),
+                    SafetyHookInline::StartDisabled
+                );
+                if (hook && hook.enable()) {
+                    spdlog::info("{} : Hooked @ {:s}+{:x}", sh.tag, module.name, hookRelAddr);
+                }
+                else {
+                    spdlog::info("{} : Failed to hook @ {:s}+{:x}", sh.tag, module.name, hookRelAddr);
+                }
+            }
+            else {
+                spdlog::info("{} : Did not find '{}'", sh.tag, sh.signature);
+            }
+        }
+    }
+
+    /**
+     * @brief Resolves the target of a relative operand.
+     * @details Instructions such as `call rel32` or `jmp rel32` encode their target relative to the end of
+     *      the instruction. This reads the 32-bit displacement and returns the absolute
+     *      address it points to.
+     *
+     * @param address Address of the instruction.
+     * @param dispOffset Offset of the 32-bit displacement within the instruction.
+     * @param length Length of the instruction in bytes.
+     *
+     * @return uintptr_t containing the absolute target address.
+     *
+     * @code
+     * // E8 xx xx xx xx            call target
+     * uintptr_t target = resolveRelative(callAddr, 1, 5);
+     * @endcode
+     */
+    uintptr_t resolveRelative(uintptr_t address, uintptr_t dispOffset, uintptr_t length);
+
+    /**
+     * @brief Patches bytes based on the provided signature to scan for.
+     *
+     * @param enable If true, the patch will be applied; otherwise, it is skipped.
+     * @param module The module to scan for the signature.
+     * @param sp Struct containing the signature and patch information.
+     *
+     * @details
+     * This function scans the specified module for the given signature pattern.
+     * If a match is found, it calculates the absolute and relative addresses,
+     * logs the location, and applies a patch at the computed address based on the
+     * information provided in the `patch` struct.
+     *
+     * @note This function only patches the first match found in the module.
+     *
+     * @see Utils::patternScan
+     * @see Utils::patch
+     */
+    void injectPatch(bool enable, Utils::ModuleInfo& module, Utils::SignaturePatch& sp);
 }

@@ -1,0 +1,69 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'   # Trigger on version tags like v1.0.0
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.3
+
+      - name: Setup CMake
+        uses: jwlawson/actions-setup-cmake@v1.14
+
+      - name: Configure project
+        run: cmake -B build -A Win32
+
+      - name: Build project
+        run: cmake --build build --config Release
+
+      - name: Package release files
+        run: |
+          mkdir package/scripts
+
+          # Copy over files from build and git repo
+          $dll = Get-Item build/Release/*.dll
+          Copy-Item $dll.FullName ("package/scripts/" + $dll.BaseName + ".asi")
+          copy ValkyriaChroniclesFix.yml package/scripts/
+          copy README.txt package/
+          copy LICENSES package/
+
+          # Download ASI Loader and extract DLL into package
+          $type = "Win32"
+          $file = "d3d9"
+          $asi = "$file-$type.zip"
+          $url = "https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/$type-latest/$file-$type.zip"
+          Invoke-WebRequest -Uri $url -OutFile $asi
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead("$asi")
+          foreach ($entry in $zip.Entries) {
+            if ($entry.Name -eq "$file.dll") {
+              [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, "package/$file.dll", $true)
+            }
+          }
+
+          $zip.Dispose()
+
+          powershell Compress-Archive -Path package/* -DestinationPath ValkyriaChroniclesFix_${{ github.ref_name }}.zip
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.event.repository.name }} ${{ github.ref_name }}
+          files: ValkyriaChroniclesFix_${{ github.ref_name }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

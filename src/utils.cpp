@@ -1,7 +1,7 @@
 /*
  * MIT License
  *
- * Copyright (c) 2024 Dominik Protasewicz
+ * Copyright (c) 2025 Dominik Protasewicz
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,19 +22,21 @@
  * SOFTWARE.
  */
 
-#include <Windows.h>
+#include <windows.h>
 #include <vector>
 #include <format>
 #include <iostream>
 #include <sstream>
+#include <span>
 #include <cstdint>
-#include <TlHelp32.h>
+#include <algorithm>
 
 #include "utils.hpp"
 
 namespace Utils
 {
-    std::string getCompilerInfo() {
+    std::string getCompilerInfo()
+    {
 #if defined(__GNUC__)
         std::string compiler = "GCC - "
             + std::to_string(__GNUC__) + "."
@@ -49,15 +51,16 @@ namespace Utils
         std::string compiler = "MSVC - "
             + std::to_string(_MSC_VER);
 #else
-        "UNKNOWN"
+        std::string compiler = "UNKNOWN";
 #endif
         return compiler;
     }
 
-    std::string bytesToString(void* bytes, size_t size) {
+    std::string bytesToString(std::span<const u8> bytes)
+    {
         std::string pattern;
-        for (size_t i = 0; i < size; i++) {
-            pattern += std::format("{:02X} ", ((uint8_t*)bytes)[i]);
+        for (u8 byte : bytes) {
+            pattern += std::format("{:02X} ", byte);
         }
         if (!pattern.empty()) {
             pattern.pop_back();
@@ -65,7 +68,8 @@ namespace Utils
         return pattern;
     }
 
-    std::pair<int, int> GetDesktopDimensions() {
+    std::pair<u32, u32> getDesktopDimensions()
+    {
         DEVMODE devMode{};
         devMode.dmSize = sizeof(DEVMODE);
         if (EnumDisplaySettings(nullptr, ENUM_CURRENT_SETTINGS, &devMode)) {
@@ -74,89 +78,104 @@ namespace Utils
         return {};
     }
 
-    void patch(uintptr_t address, const char* pattern)
+    void patch(uintptr_t address, std::string& pattern)
     {
-        static auto pattern_to_byte = [](const char* pattern) {
-            auto bytes = std::vector<uint8_t>{};
-            auto start = const_cast<char*>(pattern);
-            auto end = const_cast<char*>(pattern) + strlen(pattern);
-            for (auto current = start; current < end; ++current) {
-                bytes.push_back((uint8_t)strtoul(current, &current, 16));
+        static auto patternToByte = [](std::string& pattern) {
+            std::vector<u8> bytes;
+            std::istringstream stream(pattern.data());
+            std::string byteStr;
+
+            while (stream >> byteStr) {  // Extract space-separated hex values
+                bytes.push_back(static_cast<u8>(std::stoul(byteStr, nullptr, 16)));
             }
             return bytes;
         };
 
         DWORD oldProtect;
-        auto patternBytes = pattern_to_byte(pattern);
+        auto patternBytes = patternToByte(pattern);
         VirtualProtect((LPVOID)address, patternBytes.size(), PAGE_EXECUTE_READWRITE, &oldProtect);
         memcpy((LPVOID)address, patternBytes.data(), patternBytes.size());
         VirtualProtect((LPVOID)address, patternBytes.size(), oldProtect, &oldProtect);
     }
 
-    void patternScan(void* module, const char* signature, std::vector<uint64_t>* address)
+    uintptr_t patternScan(void* module, std::string& signature)
     {
         static auto pattern_to_byte = [](const char* pattern) {
-            std::vector<int> byteArray;
-            std::istringstream stream(pattern);
-            int byte;
-            std::string token;
+            struct Pattern {
+                std::vector<u8> bytes;
+                std::vector<u8> check;
+            };
+            auto start = const_cast<char*>(pattern);
+            auto end = const_cast<char*>(pattern) + strlen(pattern);
 
-            while (stream >> token) {
-                if (token == "?" || token == "??") {
-                    // Handle ? or ?? by adding a default byte (e.g., 0xFF)
-                    byteArray.push_back(-1);
-                } else {
-                    std::istringstream hexStream(token);
-                    hexStream >> std::hex >> byte;
-                    byteArray.push_back(byte);
+            Pattern pat = {};
+            for (auto current = start; current < end; ++current) {
+                if (*current == ' ') {
+                    continue;
+                }
+                else if (*current == '?') {
+                    current += 2;
+                    pat.bytes.push_back(0xFF);
+                    pat.check.push_back(0);
+                }
+                else {
+                    pat.bytes.push_back(strtoul(current, &current, 16));
+                    pat.check.push_back(1);
                 }
             }
-
-            return byteArray;
+            return pat;
         };
 
         auto dosHeader = (PIMAGE_DOS_HEADER)module;
-        auto ntHeaders = (PIMAGE_NT_HEADERS)((std::uint8_t*)module + dosHeader->e_lfanew);
+        auto ntHeaders = (PIMAGE_NT_HEADERS)((u8*)module + dosHeader->e_lfanew);
 
         auto sizeOfImage = ntHeaders->OptionalHeader.SizeOfImage;
-        auto patternBytes = pattern_to_byte(signature);
-        auto scanBytes = reinterpret_cast<std::uint8_t*>(module);
+        auto pattern = pattern_to_byte(signature.c_str());
+        auto scanBytes = reinterpret_cast<u8*>(module);
 
-        auto s = patternBytes.size();
-        auto d = patternBytes.data();
+        auto size = pattern.bytes.size();
+        auto data = pattern.bytes.data();
+        auto check = pattern.check.data();
 
-        for (auto i = 0ul; i < sizeOfImage - s; ++i) {
+        for (auto i = 0ul; i < sizeOfImage - size; ++i) {
             bool found = true;
-            for (auto j = 0ul; j < s; ++j) {
-                if (scanBytes[i + j] != d[j] && d[j] != -1) {
+            for (auto j = 0ul; j < pattern.bytes.size(); ++j) {
+                u8 byte = pattern.bytes.data()[j];
+                if (check[j] == 1 && scanBytes[i + j] != pattern.bytes.data()[j]) {
                     found = false;
                     break;
                 }
             }
             if (found) {
-                address->push_back((uint64_t)&scanBytes[i]);
+                return reinterpret_cast<uintptr_t>(&scanBytes[i]);
             }
         }
+        return 0;
     }
 
-    DWORD findProcessID(const char* targetProcess)
+    uintptr_t resolveRelative(uintptr_t address, uintptr_t dispOffset, uintptr_t length)
     {
-        DWORD processId = 0;
-        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snapshot != INVALID_HANDLE_VALUE) {
-            PROCESSENTRY32 processEntry;
-            processEntry.dwSize = sizeof(processEntry);
+        i32 disp = *reinterpret_cast<i32*>(address + dispOffset);
+        return address + length + disp;
+    }
 
-            if (Process32First(snapshot, &processEntry)) {
-                do {
-                    if (!strcmp(reinterpret_cast<const char*>(processEntry.szExeFile), targetProcess)) {
-                        processId = processEntry.th32ProcessID;
-                        break;
-                    }
-                } while (Process32Next(snapshot, &processEntry));
+    void injectPatch(bool enable, Utils::ModuleInfo& module, Utils::SignaturePatch& sp)
+    {
+        if (enable) {
+            uintptr_t addr = Utils::patternScan(module.address, sp.signature);
+            if (addr != 0) {
+                uintptr_t hit = addr;
+                uintptr_t absAddr = hit;
+                uintptr_t relAddr = hit - reinterpret_cast<uintptr_t>(module.address);
+                spdlog::info("{} : Found '{}' @ {:s}+{:x}", sp.tag, sp.signature, module.name, relAddr);
+                uintptr_t patchAbsAddr = absAddr + sp.patchOffset;
+                uintptr_t patchRelAddr = relAddr + sp.patchOffset;
+                Utils::patch(patchAbsAddr, sp.patch);
+                spdlog::info("{} : Patched '{}' @ {:s}+{:x}", sp.tag, sp.patch, module.name, patchRelAddr);
             }
-            CloseHandle(snapshot);
+            else {
+                spdlog::info("{} : Did not find '{}'", sp.tag, sp.signature);
+            }
         }
-        return processId;
     }
 }

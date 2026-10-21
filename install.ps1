@@ -23,7 +23,7 @@ SOFTWARE.
 #>
 
 function Show-Usage {
-    Write-Output "Usage: .\install.ps1 <path to 'Trails in the Sky FC' game folder>"
+    Write-Output "Usage: .\install.ps1 <path to 'Valkyria Chronicles' game folder>"
     exit 1
 }
 
@@ -41,42 +41,16 @@ $scriptsFolder = "scripts"
 $fullPath = "$gameFolder\$gameSubFolder\$scriptsFolder"
 
 $fixName = "ValkyriaChroniclesFix"
-$pyPatch = "ValkyriaChroniclesPatch.py"
-
-$ymlFileContent = @"
-name: Valkyria Chronicles Fix
-
-# Enables or disables all fixes
-masterEnable: true
-
-# Enter desired resolution.
-# A value of 0 in either width or height will use your desktop's resolution.
-resolution:
-  width: 0
-  height: 0
-
-# Available fixes
-fixes:
-
-  # If enabled HUD will be centered and fixed to 16:9
-  # If disabled HUD will span up to chosen resolution from above
-  centerHud:
-    enable: true
-"@
 
 if (Test-Path -Path $gameFolder) {
-    $dllPath = Get-ChildItem -Path "$PSScriptRoot\bin\*.dll" -Recurse
+    $dllPath = Get-ChildItem -Path "$PSScriptRoot\build\Release\*.dll" -Recurse
     Write-Output "Found DLL at $dllPath"
     New-Item -Path "$fullPath" -ItemType Directory -Force | Out-Null
     Write-Output "Copying DLL to $fullPath"
     Copy-Item -Path $dllPath -Destination "$fullPath"
     Move-Item -Path $fullPath\$fixName.dll -Destination $fullPath\$fixName.asi -Force
-    Write-Output "Copying $pyPatch to $fullPath"
-    Copy-Item -Path $PSScriptRoot\$pyPatch -Destination "$fullPath"
-    Write-Host "Running PyInstaller..."
-    pyinstaller --specpath $fullPath --distpath $fullPath --onefile $fullPath\$pyPatch
-    Write-Output "Creating $fixName.yml at $fullPath"
-    New-Item -Path $fullPath -Name "$fixName.yml" -ItemType File -Value $ymlFileContent -Force | Out-Null
+    Write-Output "Moving $fixName.yml to $fullPath"
+    Copy-Item -Path "$(Split-Path -Parent $PSCommandPath)\$fixName.yml" -Destination "$fullPath"
     Write-Output "Done!"
 } else {
     Write-Output "Game folder not found at $gameFolder"

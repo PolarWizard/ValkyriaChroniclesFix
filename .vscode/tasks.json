@@ -1,0 +1,53 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "configure",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-A",
+                "Win32",
+                "-DCMAKE_INSTALL_PREFIX='C:\\Program Files (x86)\\Steam\\steamapps\\common\\Valkyria Chronicles'"
+            ],
+            "group": "build"
+        },
+        {
+            "label": "build",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "build",
+                "--config",
+                "Release"
+            ],
+            "group": "build",
+            "dependsOn": ["configure"],
+            "problemMatcher": ["$msCompile"]
+        },
+        {
+            "label": "install",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--install",
+                "build",
+                "--config",
+                "Release"
+            ],
+            "group": "build",
+            "dependsOn": ["build"],
+            "problemMatcher": ["$msCompile"]
+        },
+        {
+            "label": "configure, build, and install",
+            "dependsOn": ["install"],
+            "group": "build"
+        }
+    ]
+}
