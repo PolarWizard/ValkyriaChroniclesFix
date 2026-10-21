@@ -922,6 +922,63 @@ void fixHudModels() {
 }
 
 /**
+ * @brief Keeps the radar inside its frame, undistorted.
+ *
+ * @details
+ * The radar (SlgInterfaceDrawRadarWindow) renders its own HyScreen into a square viewport placed from the
+ * radar window's virtual position. Its constructor (`FUN_00515f90`) sets that screen's 2D scale to
+ * `1280 * [0x01754318] / 154` by `720 * [0x0175431c] / 154`, and every frame `FUN_00516250` sets the viewport
+ * to `(cx -/+ 77) * [0x01754318]`, `(cy -/+ 77) * [0x0175431c]`, with no offset.
+ *
+ * With the centered HUD the x scale is `H / 720`, so the viewport is the right size but sits
+ * `(W - W169) / 2` left of the radar frame. The 2D ortho still spans `DisplayWidth = W` across the radar
+ * viewport, so its 2D scale must stay `W / 154` for the icons to keep their proportions.
+ *
+ * How was this found?
+ * The constructor stores the x scale with `fstp [eax+0x88]` and then loads the y scale with `fld [ebp+8]`
+ * (`= H / 154`). `FUN_00516250` ends with `fstp [eax+0x9c]` (the last viewport field) before its epilogue,
+ * with EAX the radar HyScreen, or 0 when the radar has none (the `je` to the epilogue).
+ *
+ * Why it works:
+ * `[ebp+8] * W / H = W / 154`, the scale the stock game uses at 16:9, and adding the 16:9 offset to both
+ * viewport x edges puts the viewport back on the radar frame. Both are no-ops at 16:9.
+ *
+ * @return void
+ */
+void fixRadar() {
+    Utils::SignatureHook scaleHook {
+        .tag = "fixRadar (scale)",
+        .signature = "D8 0D ?? ?? ?? ??    D9 98 88 00 00 00    D9 45 08    D9 98 8C 00 00 00",
+        .offset = 0x0C
+    };
+    Utils::SignatureHook viewportHook {
+        .tag = "fixRadar (viewport)",
+        .signature = "DE C1    DE C9    D9 98 9C 00 00 00    8B E5    5D    C2 08 00",
+        .offset = 0x0A
+    };
+    bool enable = yml.masterEnable && yml.hud;
+    Utils::injectHook(enable, module, scaleHook,
+        [](SafetyHookContext& ctx) {
+            if (!screen.hudCentred) {
+                return;
+            }
+            f32 scaleY = *reinterpret_cast<f32*>(ctx.ebp + 8);
+            *reinterpret_cast<f32*>(ctx.eax + 0x88) = scaleY * screen.width / screen.height;
+        }
+    );
+    Utils::injectHook(enable, module, viewportHook,
+        [](SafetyHookContext& ctx) {
+            if (ctx.eax == 0) {
+                return;
+            }
+            f32 shift = hudOffset();
+            *reinterpret_cast<f32*>(ctx.eax + 0x90) += shift;
+            *reinterpret_cast<f32*>(ctx.eax + 0x98) += shift;
+        }
+    );
+}
+
+/**
  * @brief Entry point for a DLL, called by the system when the DLL is loaded or unloaded.
  *
  * @details
@@ -965,6 +1022,7 @@ BOOL APIENTRY DllMain(
             fixHudMarkers();
             fixEyeMarks();
             fixHudModels();
+            fixRadar();
         }
         catch (const std::exception& e) {
             spdlog::error("DllMain : {}; the fixes installed before this point stay active", e.what());
