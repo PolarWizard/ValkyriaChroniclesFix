@@ -1169,6 +1169,26 @@ void fixTalkPanels() {
 }
 
 /**
+ * @brief Installs a mid-function hook at an address resolved earlier from pristine code.
+ *
+ * @details
+ * Two hooks whose signatures overlap each other's stolen bytes cannot both be found by scanning after the
+ * first is installed, so their addresses are resolved first and hooked here.
+ *
+ * @return true if the hook was installed.
+ */
+template <typename Func>
+bool hookAt(const std::string& tag, uintptr_t addr, Func&& callback) {
+    static std::vector<SafetyHookMid> hooks;
+    SafetyHookMid hook = safetyhook::create_mid(reinterpret_cast<void*>(addr), callback);
+    bool hooked = static_cast<bool>(hook);
+    hooks.push_back(std::move(hook));
+    uintptr_t relAddr = addr - reinterpret_cast<uintptr_t>(module.address);
+    spdlog::info("{} : {} @ {:s}+{:x}", tag, hooked ? "Hooked" : "Failed to hook", module.name, relAddr);
+    return hooked;
+}
+
+/**
  * @brief Locates the engine objects several fixes share, from the pristine code.
  *
  * @details
@@ -1518,6 +1538,444 @@ void fixFullscreenSprites() {
     );
 }
 
+namespace {
+    /// The world translation `fixEffects2d` shifted for one TexScreen draw, restored right after it.
+    struct EffectShift {
+        f32* top = nullptr;
+        f32 x = 0.0f;
+        f32 y = 0.0f;
+    };
+    thread_local EffectShift effectShift;
+    /// The TexScreen corners are converted, so the draw may shift the screen origin.
+    bool effectCornersHooked = false;
+    /// FUN_00713b00, the Normal2d behaviour's slot 3 (`_abmTranslateNormal2d`).
+    uintptr_t normal2dFn = 0;
+    /// The anchor resolvers' flag table (`0x008919a0`, read by FUN_006ebdd0 and FUN_006ebe90), validated before use.
+    const u32* anchorFlags = nullptr;
+    /// Every hook the 16:9 box frame needs is installed: corners, draw, restore, Normal2d, Goal2d and its placement.
+    bool effectUnit = false;
+
+    /// How a TexScreen's corners are authored. The game's 165 TexScreens are 133 ScreenPoint, 20 Full, 1 FullUnflagged
+    /// and 11 Box.
+    enum class TexFrame : u8 {
+        Legacy,         ///< Corners in pixels of the full screen.
+        ScreenPoint,    ///< Mode 1: a projected point plus a size in screen fractions.
+        Full,           ///< Covers 0..1 of the screen in flagged fractions.
+        FullUnflagged,  ///< Covers 0..1280 x 0..720 in unflagged units.
+        Box,            ///< Partial images and box-anchored pieces, laid out in the centered 16:9 box.
+    };
+
+    /// The current relative x of a TexScreen corner, as the corner loop reads it (`[this+0xf8+0x58*i]`).
+    __forceinline f32 texRelX(uintptr_t tex, u32 corner) {
+        return *reinterpret_cast<f32*>(tex + 0xF8 + 0x58 * corner);
+    }
+
+    /**
+     * @brief Classifies a TexScreen from its own fields: mode `+0x3b0`, corner 0's X anchor index `+0x94` and width
+     * flag `+0x98` (every shipped TexScreen uses one anchor and one set of flags for all four corners), and the
+     * corners' relative x.
+     *
+     * @details
+     * The corner loop (EBX) and the draw (ESI) call it with the same object and the same fields, so both always
+     * agree. Box is returned only when the whole unit is installed: a Box node whose Normal2d/Goal2d moves stay in
+     * full-screen units would land `(W - W169) / 2` to the right.
+     */
+    __forceinline TexFrame texFrame(uintptr_t tex) {
+        if (anchorFlags == nullptr) {
+            return TexFrame::Legacy;
+        }
+        u32 mode = *reinterpret_cast<u32*>(tex + 0x3B0);
+        if (mode == 1) {
+            return TexFrame::ScreenPoint;
+        }
+        if (mode != 0 && mode != 2) {
+            return TexFrame::Legacy;   // mode 3 rotates the relative size by a matrix before the corner store
+        }
+        u32 xi = *reinterpret_cast<u32*>(tex + 0x94);
+        if (xi >= 7) {
+            return TexFrame::Legacy;
+        }
+        bool fraction = *reinterpret_cast<u32*>(tex + 0x98) != 0;
+        f32 lo = texRelX(tex, 0);
+        f32 hi = lo;
+        for (u32 i = 1; i < 4; i++) {
+            lo = (std::min)(lo, texRelX(tex, i));
+            hi = (std::max)(hi, texRelX(tex, i));
+        }
+        if (xi == 0 && fraction && lo <= 0.001f && hi >= 0.999f) {
+            return TexFrame::Full;
+        }
+        if (xi == 0 && !fraction && lo <= 8.0f && hi >= 1272.0f) {
+            return TexFrame::FullUnflagged;
+        }
+        return effectUnit ? TexFrame::Box : TexFrame::Legacy;
+    }
+
+    /// How far an X anchor moves from a 16:9 screen of the same height to the full-width one: 0 for the left edge,
+    /// `DW - W169` for the right edge, and half of that for every centered anchor (their `+-H*8/9` and `+-H*2/3` terms
+    /// do not depend on the width).
+    __forceinline f32 anchorShift(u32 flags, f32 dw, f32 w169) {
+        return flags == 0 ? 0.0f : (flags & 1) != 0 ? dw - w169 : (dw - w169) / 2.0f;
+    }
+
+    /// Screen B (`[[0x0198a33c]+0x94]`), the main screen every scene context uses.
+    uintptr_t screenB() {
+        uintptr_t server = engine.sceneServer != nullptr ? *engine.sceneServer : 0;
+        return server != 0 ? *reinterpret_cast<uintptr_t*>(server + 0x94) : 0;
+    }
+}
+
+/**
+ * @brief Places the effect system's screen-space overlays on the full screen and in the centered 16:9 box.
+ *
+ * @details
+ * The Acrobata effect system draws its 2D overlays through the current scene context, which is screen B by
+ * default. They are authored in pixels of DisplayWidth/Height but the screen-B map treats them as virtual units,
+ * so with the centered HUD they land at `OX + s * x`: a full-screen overlay leaves the left `OX` pixels uncovered.
+ * - **_abmTexScreen** (`FUN_00704580`, drawn by `FUN_00704cc0`): corners are an anchor (DisplayWidth/Height
+ *   pixels, or a projected point) plus a relative size, flagged per axis as a fraction of the screen.
+ * - **_abmTranslateNormal2d** (`FUN_00713b00`) writes a pixel translation, **_abmTranslateGoal2d**
+ *   (`FUN_0070f0d0`) converts with `1280 / boxW` and `720 / boxH`.
+ * - **_abmLensFlare** (`FUN_006ff5c0`) multiplies its pixel quads by the screen's 2D scale.
+ *
+ * How was this found?
+ * The three 2D emitters of the effect code are `0x00704e7c` (TexScreen), `0x006ffe6a` (flare elements) and
+ * `0x006ffff8` (glare). The corners are formed at `0x0070492b` (`fld [esp+0x14]; fadd [esp+0x50]`: relative plus
+ * anchor), and the draw records the env's top matrix with each packet.
+ *
+ * Why it works:
+ * The corners become virtual displacements (divided by `s`, flagged sizes included), and the screen origin is
+ * subtracted once from the world translation for the draw and restored after it, so every placement
+ * (Scale/Rotate/Goal2d/Normal2d in any order) lands in pixels as at 16:9: full-screen overlays cover 0..W.
+ * Flare elements are re-centred on their lerp points and the glare quad converted to virtual units.
+ *
+ * The game's 165 TexScreens were classified from the shipped effect data: 133 ScreenPoint (mode 1, a projected
+ * point plus a size in screen fractions), 20 Full (flagged 0..1), 1 FullUnflagged (0..1280 x 0..720) and 11 Box
+ * (partial images and box-anchored pieces). `texFrame` recognizes each class from the TexScreen's own fields:
+ * - **Full** keeps the full-screen conversion above: it covers 0..W.
+ * - **FullUnflagged** stretches its 1280 units over the full width.
+ * - **ScreenPoint** sizes its fractions from W169 instead of DisplayWidth, as on a 16:9 screen of the same height.
+ * - **Box** pieces are laid out in the centered 16:9 box: their anchors lose the width the full screen added
+ *   (`anchorShift`, from the anchor resolvers' flag table `0x008919a0`), and their Normal2d and Goal2d moves get
+ *   the same correction (`0x00713b78`, and the end of `FUN_0070f0d0` at `0x0070f1ce`). This is all or nothing:
+ *   Box is used only when every one of those hooks is installed (`effectUnit`).
+ *
+ * @return void
+ */
+void fixEffects2d() {
+    bool enable = yml.masterEnable && yml.hud && engine.displaySize != nullptr;
+    if (!enable) {
+        return;
+    }
+    auto scan = [](std::string sig) { return Utils::patternScan(module.address, sig); };
+
+    // The anchor resolvers' flag table: `mov eax, [eax*4 + table]` at the entry of FUN_006ebdd0.
+    uintptr_t resolver = scan("8B 04 85 ?? ?? ?? ??    83 EC 08    85 C0    75 06    D9 EE    83 C4 08    C3    A8 01");
+    if (resolver != 0) {
+        const u32* table = *reinterpret_cast<const u32**>(resolver + 3);
+        constexpr std::array<u32, 7> expected { 0x00, 0x01, 0x02, 0x16, 0x06, 0x1A, 0x0A };
+        if (std::equal(expected.begin(), expected.end(), table)) {
+            anchorFlags = table;
+        }
+    }
+    if (anchorFlags == nullptr) {
+        LOG("{} : Did not find the effect anchor table; effect overlays keep the full-screen frame", __func__);
+    }
+
+    // Corners, draw shift and restore: the last two signatures overlap each other's stolen bytes, so all three
+    // are resolved before any is hooked, and installed restore first.
+    uintptr_t corners = scan("D9 44 24 14    D8 44 24 50    D9 5F FC    D9 44 24 2C    D8 44 24 54    D9 1F    D9 57 04");
+    uintptr_t draw = scan("8D 4E 34    6A 09    51    C6 40 6C 00    E8 ?? ?? ?? ??    83 C4 08");
+    uintptr_t restore = scan("6A 09    51    C6 40 6C 00    E8 ?? ?? ?? ??    83 C4 08    83 BE B0 03 00 00 00");
+    if (corners == 0 || draw == 0 || restore == 0) {
+        LOG("{} : Did not find the TexScreen corners, draw and restore; effects not fixed", __func__);
+        return;
+    }
+    bool restored = hookAt("fixEffects2d (restore)", restore + 0x0C,
+        [](SafetyHookContext& ctx) {
+            if (effectShift.top != nullptr) {
+                effectShift.top[12] = effectShift.x;
+                effectShift.top[13] = effectShift.y;
+                effectShift.top = nullptr;
+            }
+        }
+    );
+    bool shifted = restored && hookAt("fixEffects2d (draw)", draw + 0x0A,
+        [](SafetyHookContext& ctx) {
+            // EBX = the current scene context, ESI = the TexScreen. The x87 stack is empty.
+            effectShift.top = nullptr;
+            if (!effectCornersHooked) {
+                return;
+            }
+            uintptr_t context = *reinterpret_cast<uintptr_t*>(ctx.esi + 0x24);
+            uintptr_t contextScreen = context != 0 ? *reinterpret_cast<uintptr_t*>(context + 0x9C) : 0;
+            uintptr_t contextEnv = context != 0 ? *reinterpret_cast<uintptr_t*>(context + 0x94) : 0;
+            if (!centredMap(contextScreen, contextEnv)) {
+                return;
+            }
+            uintptr_t drawScreen = *reinterpret_cast<uintptr_t*>(ctx.ebx + 0x5C);
+            if (!centredMap(drawScreen, ctx.ebx)) {
+                return;   // drawn through a screen without the centered map: no shift
+            }
+            if (texFrame(ctx.esi) == TexFrame::Box) {
+                return;   // Box corners and their Normal2d/Goal2d moves are already in the 16:9 box's virtual units
+            }
+            uintptr_t stack = *reinterpret_cast<uintptr_t*>(ctx.ebx + 0x1E0);
+            f32* top = stack != 0 ? *reinterpret_cast<f32**>(stack + 0x1C) : nullptr;
+            if (top == nullptr) {
+                return;
+            }
+            effectShift = { top, top[12], top[13] };
+            top[12] -= originX(drawScreen) / *reinterpret_cast<f32*>(drawScreen + 0x88);
+            top[13] -= originY(drawScreen) / *reinterpret_cast<f32*>(drawScreen + 0x8C);
+        }
+    );
+    bool texScreen = shifted && hookAt("fixEffects2d (corners)", corners,
+        [](SafetyHookContext& ctx) {
+            // EBX = the TexScreen; ESI = this corner's flags: [esi-4] X anchor index, [esi] x as a fraction,
+            // [esi+8] y as a fraction. Two x87 values are live here: SSE arithmetic only, no calls returning in ST(0).
+            uintptr_t scr = *reinterpret_cast<uintptr_t*>(ctx.esp + 0x6C);   // [[ebx+0x24]+0x9C]
+            if (!centredMap(scr, *reinterpret_cast<uintptr_t*>(*reinterpret_cast<uintptr_t*>(ctx.ebx + 0x24) + 0x94))) {
+                return;
+            }
+            f32 s = *reinterpret_cast<f32*>(scr + 0x88);
+            f32 t = *reinterpret_cast<f32*>(scr + 0x8C);
+            f32 dw = engine.displaySize[0];
+            f32 w169 = engine.displaySize[1] * (16.0f / 9.0f);   // the width resolver's 16:9 width (0x006ebe9c)
+            f32 anchorX = *reinterpret_cast<f32*>(ctx.esp + 0x50);
+            f32 anchorY = *reinterpret_cast<f32*>(ctx.esp + 0x54);
+            f32& relX = *reinterpret_cast<f32*>(ctx.esp + 0x14);
+            f32& relY = *reinterpret_cast<f32*>(ctx.esp + 0x2C);
+            u32 xi = *reinterpret_cast<u32*>(ctx.esi - 4);
+            bool fractionX = *reinterpret_cast<u32*>(ctx.esi) != 0;
+            bool fractionY = *reinterpret_cast<u32*>(ctx.esi + 8) != 0;
+            TexFrame frame = xi < 7 ? texFrame(ctx.ebx) : TexFrame::Legacy;
+            u32 flags = frame != TexFrame::Legacy ? anchorFlags[xi] : 0;
+            f32 x;
+            switch (frame) {
+            case TexFrame::ScreenPoint:
+            case TexFrame::Box: {
+                // As on a 16:9 screen of the same height: the anchor without the width the full screen added, and a
+                // fraction of W169 instead of DW (sizes of a 16:9 or 4:3 width are unchanged).
+                f32 shift = frame == TexFrame::Box ? anchorShift(flags, dw, w169) : 0.0f;
+                f32 r = relX;
+                if (fractionX && (flags & 0xC) == 0) {
+                    r *= w169 / dw;
+                }
+                x = (anchorX - shift) / s + (fractionX ? r / s : r);
+                break;
+            }
+            case TexFrame::FullUnflagged:
+                x = anchorX / s + (fractionX ? relX / s : relX * dw / w169);
+                break;
+            default:
+                x = anchorX / s + (fractionX ? relX / s : relX);
+                break;
+            }
+            f32 y = anchorY / t + (fractionY ? relY / t : relY);
+            relX = x - anchorX;
+            relY = y - anchorY;
+        }
+    );
+    effectCornersHooked = texScreen;
+    if (!texScreen) {
+        LOG("{} : TexScreen hooks incomplete; the remaining effect hooks are skipped", __func__);
+        return;
+    }
+
+    Utils::SignatureHook tiling {
+        .tag = "fixEffects2d (tiling)",
+        .signature = "DE F9    D9 5C 24 04    D9 44 24 18    D9 C0    D8 4C 24 10",
+        .offset = 6
+    };
+    Utils::injectHook(true, module, tiling,
+        [](SafetyHookContext& ctx) {
+            uintptr_t context = *reinterpret_cast<uintptr_t*>(ctx.esi + 0x24);
+            uintptr_t scr = context != 0 ? *reinterpret_cast<uintptr_t*>(context + 0x9C) : 0;
+            if (!centredMap(scr, context != 0 ? *reinterpret_cast<uintptr_t*>(context + 0x94) : 0)) {
+                return;
+            }
+            *reinterpret_cast<f32*>(ctx.esp + 0x18) /= *reinterpret_cast<f32*>(scr + 0x88);
+            *reinterpret_cast<f32*>(ctx.esp + 4) /= *reinterpret_cast<f32*>(scr + 0x8C);
+        }
+    );
+
+    Utils::SignatureHook normal2d {
+        .tag = "fixEffects2d (normal2d)",
+        .signature = "8B 45 08    50    8D 54 24 04    D9 5C 24 08    E8 ?? ?? ?? ??    83 C4 04    8B E5    5D    C2 08 00",
+        .offset = 0x0C
+    };
+    normal2dFn = scan("55    8B EC    83 E4 F0    83 EC 10    8B D1    8B 42 30    83 78 0C 00");
+    bool normal2dHooked = Utils::injectHook(true, module, normal2d,
+        [](SafetyHookContext& ctx) {
+            // ESI = this (FUN_006eaed0 calls slot 3 after `mov ecx, esi`, and FUN_00713b00 keeps ESI). ECX is not
+            // reliably the descriptor: for a Y anchor index other than 0 or 1, FUN_006ebe60 leaves the float bits of
+            // DH / 2 in it. v = {x, y, z} is at [esp+4]; the x87 stack is empty.
+            uintptr_t self = ctx.esi;
+            if (self == 0 || (normal2dFn != 0 && (*reinterpret_cast<uintptr_t**>(self))[3] != normal2dFn)) {
+                return;
+            }
+            uintptr_t desc = *reinterpret_cast<uintptr_t*>(self + 0x30);
+            if (desc == 0) {
+                return;
+            }
+            uintptr_t context = *reinterpret_cast<uintptr_t*>(self + 0x24);
+            uintptr_t contextScreen = context != 0 ? *reinterpret_cast<uintptr_t*>(context + 0x9C) : 0;
+            uintptr_t scr = contextScreen != 0 ? contextScreen : screenB();
+            if (!centredMap(scr, context != 0 ? *reinterpret_cast<uintptr_t*>(context + 0x94) : 0)) {
+                return;
+            }
+            f32 s = *reinterpret_cast<f32*>(scr + 0x88);
+            f32 t = *reinterpret_cast<f32*>(scr + 0x8C);
+            bool fractionX = *reinterpret_cast<u32*>(desc + 0x0C) != 0;
+            bool fractionY = *reinterpret_cast<u32*>(desc + 0x1C) != 0;
+            f32 relX = *reinterpret_cast<f32*>(desc + 0x24);
+            f32 ux = fractionX ? 0.0f : relX;
+            f32 uy = fractionY ? 0.0f : *reinterpret_cast<f32*>(desc + 0x2C);
+            // With the whole unit, the move is laid out in the 16:9 box like the node's TexScreen (a Box node in all
+            // shipped data): the anchor as on a 16:9 screen, and a width fraction of W169 instead of DW. Only for the
+            // node's own (centered) scene-context screen, which is the screen its corners were converted for.
+            f32 shift = 0.0f;
+            u32 xi = *reinterpret_cast<u32*>(desc + 0x04);
+            if (effectUnit && contextScreen != 0 && xi < 7) {
+                u32 flags = anchorFlags[xi];
+                f32 dw = engine.displaySize[0];
+                f32 w169 = engine.displaySize[1] * (16.0f / 9.0f);
+                shift = anchorShift(flags, dw, w169);
+                if (fractionX && (flags & 0xC) == 0) {
+                    shift += (dw - w169) * relX;
+                }
+            }
+            f32* v = reinterpret_cast<f32*>(ctx.esp + 4);
+            v[0] = (v[0] - ux - shift) / s + ux;
+            v[1] = (v[1] - uy) / t + uy;
+        }
+    );
+
+    Utils::SignatureHook goal2d {
+        .tag = "fixEffects2d (goal2d)",
+        .signature = "DC 3D ?? ?? ?? ??    D9 5C 24 0C    D9 47 60    D9 1E    D9 47 64",
+        .offset = 0x0A
+    };
+    bool goal2dHooked = Utils::injectHook(true, module, goal2d,
+        [](SafetyHookContext& ctx) {
+            if (screen.hudCentred) {
+                *reinterpret_cast<f32*>(ctx.esp + 8) = *reinterpret_cast<f32*>(ctx.esp + 0x0C);
+            }
+        }
+    );
+
+    // The end of FUN_0070f0d0, after both components of the move are converted (`fadd [esi+4]; fstp [esi+4]`) and before
+    // the SEH frame is restored (`mov fs:[0], ecx`).
+    Utils::SignatureHook goal2dBox {
+        .tag = "fixEffects2d (goal2d box)",
+        .signature = "8B 4C 24 10    5B    D8 46 04    D9 5E 04    64 89 0D 00 00 00 00    83 C4 18    C3",
+        .offset = 0x0B
+    };
+    bool goal2dBoxHooked = Utils::injectHook(true, module, goal2dBox,
+        [](SafetyHookContext& ctx) {
+            // ESI = the move just converted (this+0x50 from FUN_0070f010, a local from FUN_0070ef50), EDI = the
+            // behaviour, EDX = the keyframe descriptor this call used, [esp+4] = the x factor (720 / H after the goal2d
+            // hook). The x87 stack is empty. ECX is the saved SEH link that the relocated `mov fs:[0], ecx` stores: never
+            // write it.
+            if (!effectUnit) {
+                return;
+            }
+            uintptr_t context = *reinterpret_cast<uintptr_t*>(ctx.edi + 0x24);
+            uintptr_t scr = context != 0 ? *reinterpret_cast<uintptr_t*>(context + 0x9C) : 0;
+            if (!centredMap(scr, context != 0 ? *reinterpret_cast<uintptr_t*>(context + 0x94) : 0)) {
+                return;
+            }
+            u32 xi = *reinterpret_cast<u32*>(ctx.edx + 0x04);
+            if (xi >= 7) {
+                return;
+            }
+            u32 flags = anchorFlags[xi];
+            f32 dw = engine.displaySize[0];
+            f32 w169 = engine.displaySize[1] * (16.0f / 9.0f);
+            f32 shift = anchorShift(flags, dw, w169);
+            if (*reinterpret_cast<u32*>(ctx.edx + 0x0C) != 0 && (flags & 0xC) == 0) {
+                shift += (dw - w169) * *reinterpret_cast<f32*>(ctx.edi + 0x60);
+            }
+            *reinterpret_cast<f32*>(ctx.esi) -= shift * *reinterpret_cast<f32*>(ctx.esp + 4);
+        }
+    );
+    effectUnit = anchorFlags != nullptr && normal2dHooked && goal2dHooked && goal2dBoxHooked;
+
+    Utils::SignatureHook flareElements {
+        .tag = "fixEffects2d (flare elements)",
+        .signature = "8B 43 34    DD D8    8B 48 50    DD D8    8B 93 B8 00 00 00",
+        .offset = 0x0A
+    };
+    Utils::injectHook(true, module, flareElements,
+        [](SafetyHookContext& ctx) {
+            uintptr_t scr = *reinterpret_cast<uintptr_t*>(ctx.esp + 0x48);
+            if (!centredMap(scr, 0)) {   // lens flares: no env at hand
+                return;
+            }
+            f32 s = *reinterpret_cast<f32*>(scr + 0x88);
+            f32 t = *reinterpret_cast<f32*>(scr + 0x8C);
+            f32* v = reinterpret_cast<f32*>(ctx.ebx + 0x38);
+            f32 px[4];
+            f32 py[4];
+            for (u32 i = 0; i < 4; i++) {
+                px[i] = v[6 * i] / s;
+                py[i] = v[6 * i + 1] / t;
+            }
+            // Vertex order: top left, bottom left, top right, bottom right.
+            f32 cx = (px[0] + px[2]) / 2.0f;
+            f32 cy = (py[0] + py[1]) / 2.0f;
+            f32 ox = originX(scr);
+            f32 oy = originY(scr);
+            for (u32 i = 0; i < 4; i++) {
+                v[6 * i] = (cx - ox) / s + (px[i] - cx);
+                v[6 * i + 1] = (cy - oy) / t + (py[i] - cy);
+            }
+        }
+    );
+
+    Utils::SignatureHook glare {
+        .tag = "fixEffects2d (glare)",
+        .signature = "D9 9C 24 8C 00 00 00    D9 9C 24 90 00 00 00    E8 ?? ?? ?? ??    8B 74 24 54",
+        .offset = 7
+    };
+    Utils::injectHook(true, module, glare,
+        [](SafetyHookContext& ctx) {
+            // One x87 value is live here: SSE arithmetic only.
+            uintptr_t scr = *reinterpret_cast<uintptr_t*>(ctx.esp + 0x50);
+            if (!centredMap(scr, 0)) {   // lens flares: no env at hand
+                return;
+            }
+            f32 s = *reinterpret_cast<f32*>(scr + 0x88);
+            f32 t = *reinterpret_cast<f32*>(scr + 0x8C);
+            f32 ox = originX(scr);
+            f32 oy = originY(scr);
+            f32* v = reinterpret_cast<f32*>(ctx.eax);
+            for (u32 i = 0; i < 4; i++) {
+                v[4 * i] = (v[4 * i] - ox) / s;
+                v[4 * i + 1] = (v[4 * i + 1] - oy) / t;
+            }
+        }
+    );
+
+    Utils::SignatureHook flareFade {
+        .tag = "fixEffects2d (flare fade)",
+        .signature = "D9 5C 24 40    D9 40 60    D9 9C 24 B0 00 00 00",
+        .offset = 4
+    };
+    Utils::injectHook(true, module, flareFade,
+        [](SafetyHookContext& ctx) {
+            uintptr_t scr = *reinterpret_cast<uintptr_t*>(ctx.esp + 0x48);
+            if (!centredMap(scr, 0)) {   // lens flares: no env at hand
+                return;
+            }
+            f32 height = *reinterpret_cast<f32*>(scr + 0x9C) - *reinterpret_cast<f32*>(scr + 0x94);
+            f32& halfWidth = *reinterpret_cast<f32*>(ctx.esp + 0x40);
+            halfWidth = (std::min)(halfWidth, height * 8.0f / 9.0f);
+        }
+    );
+}
+
 /**
  * @brief Keeps the radar inside its frame, undistorted.
  *
@@ -1844,6 +2302,7 @@ BOOL APIENTRY DllMain(
             fixMovieBars();
             fixBookPageMesh();
             fixFullscreenSprites();
+            fixEffects2d();
         }
         catch (const std::exception& e) {
             spdlog::error("DllMain : {}; the fixes installed before this point stay active", e.what());
