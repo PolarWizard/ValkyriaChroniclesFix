@@ -953,6 +953,89 @@ void fixHudModels() {
 }
 
 /**
+ * @brief Renders the talk scene portrait panels at the 16:9 scale.
+ *
+ * @details
+ * Talk scene panels render a portrait camera into a region of the scene capture and show that region as a
+ * panel. `FUN_00636920` sets the camera's viewport, center and zoom, and `FUN_0062ea80` the panel's UVs, from
+ * the virtual panel rect scaled by `k = boxW / 1280` on both axes (`fild [boxW]; fdiv qword [1280.0]`). With
+ * the full-width box `k = W / 1280`, so the render rects reach `0.5625 * W` rows: twice the 16:9 resolution.
+ *
+ * The Order and Potential cut-ins (SlgOrderProduction, SlgPotentialProduction) show a talk system portrait the
+ * same way: the production renders it through VlTalkEventSystem (`FUN_0062fab0`, `FUN_00636fe0`) and
+ * `FUN_0046e4d0` scales the cell's UV rect by `fx = boxW * 1024 / (sqW * 1280)` and `fy = boxW * 1024 /
+ * (sqH * 1280)`, the same `k` in render-target pixels.
+ *
+ * How was this found?
+ * Both panel functions compute `k` with the same two instructions and apply it to x and y alike; the panel quad
+ * is displayed in the HUD's virtual space, so `k` cancels on screen. `FUN_0046e4d0` loads `boxW` (`mov reg,
+ * [boxW]`) and multiplies its divisor by the same `1280.0` (`fmul qword [0x0091b198]`) for each axis.
+ *
+ * Why it works:
+ * Pointing the `boxW` and `1280.0` operands of all three at `boxH` and the double `720.0` (the constant the UI
+ * table divides by) gives `k = H / 720 = W169 / 1280`, the 16:9 value at the same height, for the camera, the
+ * panel UVs and the cut-in cell alike. The panels then fit in `H` rows, and the cut-in samples exactly where the
+ * portrait is rendered. They are patched together or not at all.
+ *
+ * @return void
+ */
+void fixTalkPanels() {
+    std::string cameraSig = "DB 05 ?? ?? ?? ??    8B 43 14    DC 35 ?? ?? ?? ??    D9 5D E4    D9 45 E4    D9 C0";
+    std::string uvSig = "DB 05 ?? ?? ?? ??    DC 35 ?? ?? ?? ??    D9 5D D0    D9 45 D0    D9 C0    D9 45 D8";
+    std::string tableSig = "DB 05 ?? ?? ?? ??    8B 4D F4    5F    89 1D ?? ?? ?? ??    DC 35 ?? ?? ?? ??    5E    5B    "
+                           "D9 1D ?? ?? ?? ??    64 89 0D 00 00 00 00    8B E5    5D    C3";
+    // FUN_0046e4d0's x and y scales: `mov reg, [boxW]; mov [ebp-0x20], reg; <static init guard>; fild [ebp-0x20];
+    // fmul qword [1024.0]; fild [sqW or sqH]; fmul qword [1280.0]; fdivp`.
+    std::string cellXSig = "8B 15 ?? ?? ?? ??    89 55 E0    84 1D ?? ?? ?? ??    75 21    09 1D ?? ?? ?? ??    89 5D FC    "
+                           "E8 ?? ?? ?? ??    68 ?? ?? ?? ??    E8 ?? ?? ?? ??    8B 4D 08    83 C4 04    89 7D FC    "
+                           "DB 45 E0    DC 0D ?? ?? ?? ??    DB 05 ?? ?? ?? ??    DC 0D ?? ?? ?? ??    DE F9";
+    std::string cellYSig = "A1 ?? ?? ?? ??    89 45 E0    84 1D ?? ?? ?? ??    75 25    09 1D ?? ?? ?? ??    "
+                           "C7 45 FC 03 00 00 00    E8 ?? ?? ?? ??    68 ?? ?? ?? ??    E8 ?? ?? ?? ??    8B 4D 08    83 C4 04    "
+                           "89 7D FC    83 7D 10 00    DB 45 E0    DC 0D ?? ?? ?? ??    DB 05 ?? ?? ?? ??    DC 0D ?? ?? ?? ??    DE F9";
+    bool enable = yml.masterEnable && screenStruct.boxHeight != nullptr;
+    if (!enable) {
+        return;
+    }
+    uintptr_t camera = Utils::patternScan(module.address, cameraSig);
+    uintptr_t uv = Utils::patternScan(module.address, uvSig);
+    uintptr_t table = Utils::patternScan(module.address, tableSig);
+    uintptr_t cellX = Utils::patternScan(module.address, cellXSig);
+    uintptr_t cellY = Utils::patternScan(module.address, cellYSig);
+    if (camera == 0 || uv == 0 || table == 0 || cellX == 0 || cellY == 0) {
+        LOG("{} : Did not find the panel scale, the cut-in cell scale or the UI table; not patched", __func__);
+        return;
+    }
+    auto operand = [](uintptr_t addr) { return *reinterpret_cast<uintptr_t*>(addr); };
+    uintptr_t boxW = reinterpret_cast<uintptr_t>(screenStruct.boxWidth);
+    uintptr_t boxH = reinterpret_cast<uintptr_t>(screenStruct.boxHeight);
+    // fdiv qword [720.0] of the table's y scale.
+    uintptr_t div720 = operand(table + 0x12);
+    uintptr_t div1280 = operand(camera + 0x0B);
+    uintptr_t sqW = reinterpret_cast<uintptr_t>(screenStruct.squareWidth);
+    uintptr_t sqH = reinterpret_cast<uintptr_t>(screenStruct.squareHeight);
+    bool layout = operand(camera + 0x02) == boxW && operand(uv + 0x02) == boxW && operand(uv + 0x08) == div1280 &&
+        operand(table + 0x02) == boxH &&
+        operand(cellX + 0x02) == boxW && operand(cellX + 0x3D) == sqW && operand(cellX + 0x43) == div1280 &&
+        operand(cellY + 0x01) == boxW && operand(cellY + 0x44) == sqH && operand(cellY + 0x4A) == div1280;
+    bool constants = *reinterpret_cast<f64*>(div1280) == 1280.0 && *reinterpret_cast<f64*>(div720) == 720.0;
+    if (!layout || !constants) {
+        LOG("{} : Unexpected operands; not patched", __func__);
+        return;
+    }
+    widePatches.push_back(pointerPatch(camera + 0x02, boxH));
+    widePatches.push_back(pointerPatch(camera + 0x0B, div720));
+    widePatches.push_back(pointerPatch(uv + 0x02, boxH));
+    widePatches.push_back(pointerPatch(uv + 0x08, div720));
+    widePatches.push_back(pointerPatch(cellX + 0x02, boxH));
+    widePatches.push_back(pointerPatch(cellX + 0x43, div720));
+    widePatches.push_back(pointerPatch(cellY + 0x01, boxH));
+    widePatches.push_back(pointerPatch(cellY + 0x4A, div720));
+    uintptr_t base = reinterpret_cast<uintptr_t>(module.address);
+    LOG("{} : Found camera scale @ {:s}+{:x}, UV scale @ {:s}+{:x}, cut-in cell scale @ {:s}+{:x}", __func__,
+        module.name, camera - base, module.name, uv - base, module.name, cellX - base);
+}
+
+/**
  * @brief Locates the engine objects several fixes share, from the pristine code.
  *
  * @details
@@ -1131,6 +1214,7 @@ BOOL APIENTRY DllMain(
             fixDisplayMode();
             fixResolution();
             fixTextLayout();
+            fixTalkPanels();
             fixHud();
             fixFullscreenBackgrounds();
             fixFades();
