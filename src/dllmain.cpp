@@ -124,11 +124,35 @@ namespace {
         u32* guard = nullptr;
     } screenStruct;
 
+    /**
+     * @brief Engine objects located by signature before any hook is installed.
+     *
+     * @details
+     * Several of these operands sit inside the bytes a later mid-hook overwrites, so they are all read once,
+     * up front, from the pristine code.
+     */
+    struct Engine {
+        f32* displaySize = nullptr;         ///< DisplayWidth, DisplayHeight (`0x01a7fc20`).
+    } engine;
+
     /// A byte patch whose original bytes were matched by its signature, applied once the mode is known.
     struct BytePatch {
         uintptr_t address = 0;
         std::vector<u8> bytes;
     };
+    /// Operand redirections applied once the resolution hook has seen an ultrawide screen (`fixTextLayout`,
+    /// `fixTalkPanels`).
+    std::vector<BytePatch> widePatches;
+
+    /// A patch that points the 4-byte absolute operand at `address` to `value`.
+    BytePatch pointerPatch(uintptr_t address, uintptr_t value) {
+        std::vector<u8> bytes(sizeof(value));
+        memcpy(bytes.data(), &value, sizeof(value));
+        return { address, bytes };
+    }
+
+    /// Target of the `fld [DisplayWidth]` operands redirected by `fixTextLayout`; holds W169.
+    f32 width169Operand = 0.0f;
 
     /// Return address of the `FUN_00610430` call in the unit avoidance check `FUN_004da1f0`.
     uintptr_t avoidanceReturn = 0;
@@ -589,6 +613,13 @@ void fixResolution() {
             screen.height = static_cast<f32>(h);
             screen.width169 = screen.height * 16.0f / 9.0f;
             screen.offset169 = (screen.width - screen.width169) / 2.0f;
+
+            if (screen.ultrawide) {
+                width169Operand = screen.width169;
+                for (const BytePatch& patch : widePatches) {
+                    applyBytePatch(patch);
+                }
+            }
         }
     );
 }
@@ -922,6 +953,33 @@ void fixHudModels() {
 }
 
 /**
+ * @brief Locates the engine objects several fixes share, from the pristine code.
+ *
+ * @details
+ * - **DisplayWidth/Height.** The X anchor resolver's `fld [DisplayWidth]`, read before `fixTextLayout`
+ *   redirects that operand.
+ *
+ * A failure disables only the fixes that need that object, and is logged.
+ *
+ * @return void
+ */
+void resolveShared() {
+    if (!yml.masterEnable) {
+        return;
+    }
+    auto scan = [](std::string sig) { return Utils::patternScan(module.address, sig); };
+    auto operand = [](uintptr_t addr) { return *reinterpret_cast<uintptr_t*>(addr); };
+
+    uintptr_t anchor = scan("A8 01    74 0A    D9 05 ?? ?? ?? ??    8B E5    5D    C3    D9 05 ?? ?? ?? ??    DC 0D");
+    if (anchor != 0 && operand(anchor + 0x06) == operand(anchor + 0x10)) {
+        engine.displaySize = reinterpret_cast<f32*>(operand(anchor + 0x06));
+    }
+    else {
+        LOG("Did not find DisplayWidth");
+    }
+}
+
+/**
  * @brief Keeps the radar inside its frame, undistorted.
  *
  * @details
@@ -979,6 +1037,61 @@ void fixRadar() {
 }
 
 /**
+ * @brief Lays out text boxes and subtitles as on a 16:9 screen.
+ *
+ * @details
+ * VlSprite (text box backgrounds, through `FUN_00609840`) and VlSubtitles (`FUN_0060d520`, `FUN_0060d830`)
+ * place themselves from `DisplayWidth`. The X anchor resolver `FUN_006103a0` returns `DisplayWidth` for its
+ * right anchor and `DisplayWidth / 2` plus or minus a 16:9 or 4:3 half width for the others, and the
+ * subtitle wrap width is `0.8 * DisplayWidth`. With the full-width box the text box anchors land outside the
+ * screen at 32:9 and the subtitle lines span 80% of the ultrawide width.
+ *
+ * How was this found?
+ * The anchor resolver reads `fld [0x01a7fc20]` twice (`test al, 1; je; fld [DisplayWidth]` for the right
+ * anchor, then `fld [DisplayWidth]; fmul` for the half width), and both subtitle functions start their width
+ * with `fld [0x01a7fc20]; fmul qword [0.8]`.
+ *
+ * Why it works:
+ * Reading W169 instead of `DisplayWidth` in those four loads gives exactly the layout of a 16:9 screen of the
+ * same height. The operands are redirected only once the resolution hook has seen an ultrawide screen, so
+ * 16:9 and narrower screens keep reading `DisplayWidth`.
+ *
+ * @return void
+ */
+void fixTextLayout() {
+    struct Operand {
+        std::string tag;
+        std::string signature;
+        uintptr_t offset;
+    };
+    std::array<Operand, 4> operands {{
+        { "fixTextLayout (anchor right)",  "A8 01    74 0A    D9 05 ?? ?? ?? ??    8B E5    5D    C3    D9 05 ?? ?? ?? ??    DC 0D", 0x06 },
+        { "fixTextLayout (anchor half)",   "A8 01    74 0A    D9 05 ?? ?? ?? ??    8B E5    5D    C3    D9 05 ?? ?? ?? ??    DC 0D", 0x10 },
+        { "fixTextLayout (subtitle draw)", "D9 05 ?? ?? ?? ??    DC 0D ?? ?? ?? ??    8B 74 24 10    8B 86 80 00 00 00",       0x02 },
+        { "fixTextLayout (subtitle text)", "D9 05 ?? ?? ?? ??    DC 0D ?? ?? ?? ??    D9 5D 08    D9 45 08    D9 C0",           0x02 },
+    }};
+    bool enable = yml.masterEnable && engine.displaySize != nullptr;
+    if (!enable) {
+        return;
+    }
+    // All four or none: the anchors and the subtitle widths must agree.
+    std::vector<BytePatch> found;
+    for (Operand& operand : operands) {
+        uintptr_t addr = Utils::patternScan(module.address, operand.signature);
+        uintptr_t site = addr + operand.offset;
+        if (addr == 0 || *reinterpret_cast<uintptr_t*>(site) != reinterpret_cast<uintptr_t>(engine.displaySize)) {
+            LOG("{} : Did not find 'fld [DisplayWidth]' at '{}'; text layout not fixed", operand.tag,
+                operand.signature);
+            return;
+        }
+        found.push_back(pointerPatch(site, reinterpret_cast<uintptr_t>(&width169Operand)));
+        LOG("{} : Found '{}', operand @ {:s}+{:x}", operand.tag, operand.signature, module.name,
+            site - reinterpret_cast<uintptr_t>(module.address));
+    }
+    widePatches.insert(widePatches.end(), found.begin(), found.end());
+}
+
+/**
  * @brief Entry point for a DLL, called by the system when the DLL is loaded or unloaded.
  *
  * @details
@@ -1013,9 +1126,11 @@ BOOL APIENTRY DllMain(
         }
         try {
             readYml();
+            resolveShared();
             fixLargeAddressAware();
             fixDisplayMode();
             fixResolution();
+            fixTextLayout();
             fixHud();
             fixFullscreenBackgrounds();
             fixFades();
